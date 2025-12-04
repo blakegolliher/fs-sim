@@ -1,0 +1,93 @@
+# FS-Simulator Configuration - Small Test Case
+# Use this for quick testing with fewer files
+
+base_dir: "/export/testfs-small"
+log_file: "/tmp/fs_sim_files_small.log"
+
+# Small scale for testing
+target_dirs: 1000
+target_files: 10000
+
+update_duration_seconds: 30
+
+min_file_age: 1640995200
+max_file_age: 0
+
+uids:
+  - 1001
+  - 1002
+  - 1003
+  - 1004
+  - 1005
+  - 1006
+  - 1007
+  - 1008
+  - 1009
+  - 1010
+  - 1011
+  - 1012
+
+gids:
+  - 1001
+  - 1002
+  - 1003
+  - 1004
+  - 1005
+  - 1006
+  - 1007
+  - 1008
+  - 1009
+  - 1010
+  - 1011
+  - 1012
+
+action_weights:
+  create_file: 40
+  delete_file: 20
+  append_file: 20
+  change_metadata: 15
+  touch_file: 5
+
+file_size:
+  min_normal: 0
+  max_normal: 10240
+  large_file_chance: 2
+  min_large: 1048576
+  max_large: 104857600  # 100MB max for small test
+
+max_depth: 5
+max_subdirs_per_dir: 3
+
+file_extensions:
+  home:
+    - ".txt"
+    - ".doc"
+    - ".pdf"
+    - ".jpg"
+    - ".mp3"
+    - ".zip"
+    - ".md"
+  scratch:
+    - ".c"
+    - ".h"
+    - ".o"
+    - ".log"
+    - ".err"
+    - ".tmp"
+    - ".sh"
+    - ".py"
+  data:
+    - ".fastq"
+    - ".sam"
+    - ".bam"
+    - ".vcf"
+    - ".bed"
+    - ".gz"
+  web:
+    - ".html"
+    - ".css"
+    - ".js"
+    - ".json"
+    - ".xml"
+    - ".svg"
+    - ".ts"

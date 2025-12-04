@@ -1,0 +1,112 @@
+# FS-Simulator Configuration
+# This file controls the filesystem simulation parameters
+
+# Base directory for the simulated filesystem
+# base_dir: "/export/testfs"
+base_dir: "/mnt/syncengine-demo"
+
+# Log file path - tracks all created files for update mode
+log_file: "/tmp/fs_sim_files.log"
+
+# Target counts for initial population
+target_dirs: 200000
+target_files: 2000000
+
+# How long update mode runs (in seconds)
+update_duration_seconds: 60
+
+# Date range for file timestamps (Unix epoch seconds)
+# Files will be randomly assigned timestamps between these dates
+min_file_age: 1640995200  # January 1, 2022 00:00:00 UTC
+max_file_age: 0           # 0 means use current time
+
+# Number of parallel workers (0 = auto-detect CPU count)
+workers: 64
+
+# User/Group IDs for random ownership assignment
+# These must exist on the system before running the simulator
+uids:
+  - 1001  # ada
+  - 1002  # turing
+  - 1003  # lovelace
+  - 1004  # hopper
+  - 1005  # dijkstra
+  - 1006  # knuth
+  - 1007  # ritchie
+  - 1008  # thompson
+  - 1009  # torvalds
+  - 1010  # gosling
+  - 1011  # wozniak
+  - 1012  # cerf
+
+gids:
+  - 1001
+  - 1002
+  - 1003
+  - 1004
+  - 1005
+  - 1006
+  - 1007
+  - 1008
+  - 1009
+  - 1010
+  - 1011
+  - 1012
+
+# Action weights for dynamic update mode (relative probabilities)
+action_weights:
+  create_file: 40
+  delete_file: 20
+  append_file: 20
+  change_metadata: 15
+  touch_file: 5
+
+# File size configuration
+file_size:
+  # Normal file size range (bytes)
+  min_normal: 0
+  max_normal: 10240          # 10KB
+  # Large file probability (percentage, 0-100)
+  large_file_chance: 1       # Reduced from 5%
+  # Large file size range (bytes)
+  min_large: 1048576         # 1MB
+  max_large: 104857600       # 100MB (reduced from 1GB)
+
+# Directory structure
+max_depth: 10
+max_subdirs_per_dir: 4
+
+# File extension categories
+file_extensions:
+  home:
+    - ".txt"
+    - ".doc"
+    - ".pdf"
+    - ".jpg"
+    - ".mp3"
+    - ".zip"
+    - ".md"
+  scratch:
+    - ".c"
+    - ".h"
+    - ".o"
+    - ".log"
+    - ".err"
+    - ".tmp"
+    - ".sh"
+    - ".py"
+  data:
+    - ".fastq"
+    - ".sam"
+    - ".bam"
+    - ".vcf"
+    - ".bed"
+    - ".gz"
+  web:
+    - ".html"
+    - ".css"
+    - ".js"
+    - ".json"
+    - ".xml"
+    - ".svg"
+    - ".ts"
