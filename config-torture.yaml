@@ -1,0 +1,82 @@
+# FS-Simulator TORTURE MODE Configuration
+# Creates flat directories with massive file counts for stress testing
+# filesystem crawlers and scanners.
+#
+# Target: 200M files per directory × 36 directories = 7.2 billion files
+# Capacity: 200M × 1KB × 36 = ~7.2TB (well under 50TB limit)
+
+# Base directory - the mounted filesystem to torture
+base_dir: "/mnt/fs-tourture"
+
+# Log file (not used in torture mode, but required by config)
+log_file: "/tmp/fs_torture_files.log"
+
+# Parallel workers - adjust based on your system
+# More workers = faster, but also more I/O pressure
+workers: 128
+
+# User/Group IDs (only used if skip_metadata is false)
+uids: [1000]
+gids: [1000]
+
+# Dummy file_extensions (required by config parser)
+file_extensions:
+  data:
+    - ".dat"
+
+# TORTURE MODE CONFIGURATION
+torture:
+  # List of flat directories to create under base_dir
+  # Each directory will contain files_per_dir files
+  flat_dirs:
+    - "torture_01"
+    - "torture_02"
+    - "torture_03"
+    - "torture_04"
+    - "torture_05"
+    - "torture_06"
+    - "torture_07"
+    - "torture_08"
+    - "torture_09"
+    - "torture_10"
+    - "torture_11"
+    - "torture_12"
+    - "torture_13"
+    - "torture_14"
+    - "torture_15"
+    - "torture_16"
+    - "torture_17"
+    - "torture_18"
+    - "torture_19"
+    - "torture_20"
+    - "torture_21"
+    - "torture_22"
+    - "torture_23"
+    - "torture_24"
+    - "torture_25"
+    - "torture_26"
+    - "torture_27"
+    - "torture_28"
+    - "torture_29"
+    - "torture_30"
+    - "torture_31"
+    - "torture_32"
+    - "torture_33"
+    - "torture_34"
+    - "torture_35"
+    - "torture_36"
+
+  # Number of files per flat directory
+  # 200,000,000 = 200 million files
+  files_per_dir: 200000000
+
+  # Fixed file size in bytes (1KB = 1024 bytes)
+  file_size_bytes: 1024
+
+  # Skip chown/chmod/chtimes for maximum speed
+  # Set to false if you need realistic metadata
+  skip_metadata: true
+
+  # Progress report interval (every N files)
+  # 10 million = report ~20 times per directory
+  report_interval: 10000000

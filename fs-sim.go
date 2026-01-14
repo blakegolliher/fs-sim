@@ -46,6 +46,15 @@ type Config struct {
 	MaxDepth         int                 `yaml:"max_depth"`
 	MaxSubdirsPerDir int                 `yaml:"max_subdirs_per_dir"`
 	FileExtensions   map[string][]string `yaml:"file_extensions"`
+
+	// Torture mode config - for creating flat directories with massive file counts
+	Torture struct {
+		FlatDirs        []string `yaml:"flat_dirs"`         // List of flat directory names to create
+		FilesPerDir     int64    `yaml:"files_per_dir"`     // Number of files per flat directory
+		FileSizeBytes   int      `yaml:"file_size_bytes"`   // Fixed file size in bytes
+		SkipMetadata    bool     `yaml:"skip_metadata"`     // Skip chown/chmod for speed
+		ReportInterval  int64    `yaml:"report_interval"`   // Progress report every N files
+	} `yaml:"torture"`
 }
 
 // Global config
@@ -415,6 +424,147 @@ func populateFilesystem() error {
 	return nil
 }
 
+// TortureJob represents a range of files to create in a directory
+type TortureJob struct {
+	DirPath   string
+	StartFile int64
+	EndFile   int64
+}
+
+// populateTorture creates flat directories with massive file counts for stress testing
+func populateTorture() error {
+	fmt.Println("=== TORTURE MODE: Flat Directory Stress Test ===")
+	fmt.Printf("Target: %d files per directory\n", cfg.Torture.FilesPerDir)
+	fmt.Printf("Directories: %v\n", cfg.Torture.FlatDirs)
+	fmt.Printf("File size: %d bytes\n", cfg.Torture.FileSizeBytes)
+	fmt.Printf("Workers: %d\n", cfg.Workers)
+	fmt.Printf("Skip metadata: %v\n", cfg.Torture.SkipMetadata)
+	fmt.Println()
+
+	if len(cfg.Torture.FlatDirs) == 0 {
+		return fmt.Errorf("torture.flat_dirs must be specified")
+	}
+	if cfg.Torture.FilesPerDir <= 0 {
+		return fmt.Errorf("torture.files_per_dir must be positive")
+	}
+
+	// Default report interval
+	reportInterval := cfg.Torture.ReportInterval
+	if reportInterval <= 0 {
+		reportInterval = 1000000 // 1M files
+	}
+
+	// Ensure base directory exists
+	if err := os.MkdirAll(cfg.BaseDir, 0755); err != nil {
+		return fmt.Errorf("failed to create base directory: %w", err)
+	}
+
+	totalStartTime := time.Now()
+	var totalFiles int64
+
+	// Process each flat directory
+	for dirIdx, dirName := range cfg.Torture.FlatDirs {
+		dirPath := filepath.Join(cfg.BaseDir, dirName)
+		fmt.Printf("\n--- Directory %d/%d: %s ---\n", dirIdx+1, len(cfg.Torture.FlatDirs), dirPath)
+
+		// Create the directory
+		if err := os.MkdirAll(dirPath, 0755); err != nil {
+			return fmt.Errorf("failed to create directory %s: %w", dirPath, err)
+		}
+
+		dirStartTime := time.Now()
+		var fileCount atomic.Int64
+
+		// Channel for file creation jobs (batched by range)
+		jobs := make(chan TortureJob, cfg.Workers*2)
+		var wg sync.WaitGroup
+
+		// Start worker goroutines
+		for w := 0; w < cfg.Workers; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				// Each worker gets its own random buffer
+				fr := NewFastRandom(64 * 1024)
+				content := make([]byte, cfg.Torture.FileSizeBytes)
+				fr.Fill(content)
+
+				for job := range jobs {
+					for fileNum := job.StartFile; fileNum < job.EndFile; fileNum++ {
+						// Simple numeric filename: f_000000000001.dat
+						fileName := fmt.Sprintf("f_%012d.dat", fileNum)
+						filePath := filepath.Join(job.DirPath, fileName)
+
+						// Create file with pre-filled content
+						f, err := os.Create(filePath)
+						if err != nil {
+							continue
+						}
+						f.Write(content)
+						f.Close()
+
+						if !cfg.Torture.SkipMetadata {
+							setMetadata(filePath, false)
+						}
+
+						count := fileCount.Add(1)
+						if count%reportInterval == 0 {
+							elapsed := time.Since(dirStartTime)
+							rate := float64(count) / elapsed.Seconds()
+							pct := float64(count) / float64(cfg.Torture.FilesPerDir) * 100
+							fmt.Printf("  Progress: %d files (%.1f%%) - %.0f files/sec\n", count, pct, rate)
+						}
+					}
+				}
+			}()
+		}
+
+		// Generate jobs - batch files into chunks
+		go func() {
+			batchSize := int64(10000) // 10K files per job
+			for start := int64(0); start < cfg.Torture.FilesPerDir; start += batchSize {
+				end := start + batchSize
+				if end > cfg.Torture.FilesPerDir {
+					end = cfg.Torture.FilesPerDir
+				}
+				jobs <- TortureJob{
+					DirPath:   dirPath,
+					StartFile: start,
+					EndFile:   end,
+				}
+			}
+			close(jobs)
+		}()
+
+		// Wait for all workers
+		wg.Wait()
+
+		dirElapsed := time.Since(dirStartTime)
+		dirCount := fileCount.Load()
+		dirRate := float64(dirCount) / dirElapsed.Seconds()
+		totalFiles += dirCount
+
+		fmt.Printf("  Directory complete: %d files in %s (%.0f files/sec)\n",
+			dirCount, dirElapsed.Round(time.Second), dirRate)
+	}
+
+	totalElapsed := time.Since(totalStartTime)
+	totalRate := float64(totalFiles) / totalElapsed.Seconds()
+
+	fmt.Printf("\n=== TORTURE MODE COMPLETE ===\n")
+	fmt.Printf("Total Files: %d\n", totalFiles)
+	fmt.Printf("Total Directories: %d\n", len(cfg.Torture.FlatDirs))
+	fmt.Printf("Total Time: %s\n", totalElapsed.Round(time.Second))
+	fmt.Printf("Overall Rate: %.0f files/sec\n", totalRate)
+
+	// Calculate capacity used
+	capacityBytes := totalFiles * int64(cfg.Torture.FileSizeBytes)
+	capacityGB := float64(capacityBytes) / (1024 * 1024 * 1024)
+	fmt.Printf("Capacity Used: %.2f GB\n", capacityGB)
+
+	return nil
+}
+
 // FileIndex provides efficient random file selection from the log file
 type FileIndex struct {
 	paths     []string
@@ -713,7 +863,8 @@ func main() {
 		fmt.Println("       fs-sim --mode=<mode> [--config=config.yaml]")
 		fmt.Println("")
 		fmt.Println("Modes:")
-		fmt.Println("  populate  Create initial filesystem structure")
+		fmt.Println("  populate  Create initial filesystem structure (hierarchical)")
+		fmt.Println("  torture   Create flat directories with massive file counts")
 		fmt.Println("  update    Run dynamic changes (for cron jobs)")
 		fmt.Println("")
 		fmt.Println("Options:")
@@ -734,13 +885,18 @@ func main() {
 			fmt.Printf("FATAL POPULATE ERROR: %v\n", err)
 			os.Exit(1)
 		}
+	case "torture":
+		if err := populateTorture(); err != nil {
+			fmt.Printf("FATAL TORTURE ERROR: %v\n", err)
+			os.Exit(1)
+		}
 	case "update":
 		if err := runDynamicUpdate(); err != nil {
 			fmt.Printf("FATAL UPDATE ERROR: %v\n", err)
 			os.Exit(1)
 		}
 	default:
-		fmt.Printf("Invalid mode: %s. Use 'populate' or 'update'.\n", mode)
+		fmt.Printf("Invalid mode: %s. Use 'populate', 'torture', or 'update'.\n", mode)
 		os.Exit(1)
 	}
 }
