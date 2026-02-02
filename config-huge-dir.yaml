@@ -1,0 +1,23 @@
+# Benchmark: Single Huge Directory
+# 500K files in ONE directory
+# Tests: Single-directory enumeration, READDIRPLUS limits
+
+base_dir: "/mnt/syncengine-demo/bench/huge-dir"
+log_file: "/tmp/fs_sim_huge.log"
+
+workers: 64
+
+# Dummy values (required by config parser)
+file_extensions:
+  data:
+    - ".dat"
+uids: [1000]
+gids: [1000]
+
+torture:
+  flat_dirs:
+    - "huge-dir"
+  files_per_dir: 500000
+  file_size_bytes: 1024
+  skip_metadata: true
+  report_interval: 50000

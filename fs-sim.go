@@ -49,12 +49,21 @@ type Config struct {
 
 	// Torture mode config - for creating flat directories with massive file counts
 	Torture struct {
-		FlatDirs        []string `yaml:"flat_dirs"`         // List of flat directory names to create
-		FilesPerDir     int64    `yaml:"files_per_dir"`     // Number of files per flat directory
-		FileSizeBytes   int      `yaml:"file_size_bytes"`   // Fixed file size in bytes
-		SkipMetadata    bool     `yaml:"skip_metadata"`     // Skip chown/chmod for speed
-		ReportInterval  int64    `yaml:"report_interval"`   // Progress report every N files
+		FlatDirs       []string `yaml:"flat_dirs"`        // List of flat directory names to create
+		FilesPerDir    int64    `yaml:"files_per_dir"`    // Number of files per flat directory
+		FileSizeBytes  int      `yaml:"file_size_bytes"`  // Fixed file size in bytes
+		SkipMetadata   bool     `yaml:"skip_metadata"`    // Skip chown/chmod for speed
+		ReportInterval int64    `yaml:"report_interval"`  // Progress report every N files
 	} `yaml:"torture"`
+
+	// Deep mode config - for creating narrow-deep directory chains
+	Deep struct {
+		Depth          int  `yaml:"depth"`            // Number of nested directory levels
+		FilesPerLevel  int  `yaml:"files_per_level"`  // Number of files at each level
+		FileSizeBytes  int  `yaml:"file_size_bytes"`  // Fixed file size in bytes
+		SkipMetadata   bool `yaml:"skip_metadata"`    // Skip chown/chmod for speed
+		ReportInterval int  `yaml:"report_interval"`  // Progress report every N levels
+	} `yaml:"deep"`
 }
 
 // Global config
@@ -565,6 +574,106 @@ func populateTorture() error {
 	return nil
 }
 
+// populateDeep creates a narrow-deep directory chain for benchmarking recursion
+func populateDeep() error {
+	fmt.Println("=== DEEP MODE: Narrow-Deep Directory Chain ===")
+	fmt.Printf("Target depth: %d levels\n", cfg.Deep.Depth)
+	fmt.Printf("Files per level: %d\n", cfg.Deep.FilesPerLevel)
+	fmt.Printf("File size: %d bytes\n", cfg.Deep.FileSizeBytes)
+	fmt.Printf("Skip metadata: %v\n", cfg.Deep.SkipMetadata)
+	fmt.Println()
+
+	if cfg.Deep.Depth <= 0 {
+		return fmt.Errorf("deep.depth must be positive")
+	}
+	if cfg.Deep.FilesPerLevel < 0 {
+		return fmt.Errorf("deep.files_per_level must be non-negative")
+	}
+
+	// Default file size
+	fileSize := cfg.Deep.FileSizeBytes
+	if fileSize <= 0 {
+		fileSize = 1024 // 1KB default
+	}
+
+	// Default report interval
+	reportInterval := cfg.Deep.ReportInterval
+	if reportInterval <= 0 {
+		reportInterval = 100
+	}
+
+	startTime := time.Now()
+
+	// Ensure base directory exists
+	if err := os.MkdirAll(cfg.BaseDir, 0755); err != nil {
+		return fmt.Errorf("failed to create base directory: %w", err)
+	}
+
+	// Create random data buffer
+	fr := NewFastRandom(64 * 1024)
+	content := make([]byte, fileSize)
+	fr.Fill(content)
+
+	currentPath := cfg.BaseDir
+	totalFiles := 0
+
+	for level := 1; level <= cfg.Deep.Depth; level++ {
+		// Create directory for this level
+		dirName := fmt.Sprintf("level_%04d", level)
+		currentPath = filepath.Join(currentPath, dirName)
+
+		if err := os.Mkdir(currentPath, 0755); err != nil {
+			return fmt.Errorf("failed to create directory at level %d: %w", level, err)
+		}
+
+		if !cfg.Deep.SkipMetadata {
+			setMetadata(currentPath, true)
+		}
+
+		// Create files at this level
+		for f := 1; f <= cfg.Deep.FilesPerLevel; f++ {
+			fileName := fmt.Sprintf("file_%04d.dat", f)
+			filePath := filepath.Join(currentPath, fileName)
+
+			file, err := os.Create(filePath)
+			if err != nil {
+				return fmt.Errorf("failed to create file at level %d: %w", level, err)
+			}
+			file.Write(content)
+			file.Close()
+
+			if !cfg.Deep.SkipMetadata {
+				setMetadata(filePath, false)
+			}
+
+			totalFiles++
+		}
+
+		// Progress report
+		if level%reportInterval == 0 {
+			elapsed := time.Since(startTime)
+			fmt.Printf("  Level %d/%d - %d files (%.1f sec)\n",
+				level, cfg.Deep.Depth, totalFiles, elapsed.Seconds())
+		}
+	}
+
+	elapsed := time.Since(startTime)
+	totalDirs := cfg.Deep.Depth
+
+	fmt.Printf("\n=== DEEP MODE COMPLETE ===\n")
+	fmt.Printf("Total Levels: %d\n", totalDirs)
+	fmt.Printf("Total Files: %d\n", totalFiles)
+	fmt.Printf("Total Time: %s\n", elapsed.Round(time.Millisecond))
+	fmt.Printf("Deepest Path: %s\n", currentPath)
+
+	// Calculate capacity
+	capacityBytes := int64(totalFiles) * int64(fileSize)
+	capacityKB := float64(capacityBytes) / 1024
+	fmt.Printf("Capacity Used: %.2f KB\n", capacityKB)
+
+	return nil
+}
+
 // FileIndex provides efficient random file selection from the log file
 type FileIndex struct {
 	paths     []string
@@ -865,6 +974,7 @@ func main() {
 		fmt.Println("Modes:")
 		fmt.Println("  populate  Create initial filesystem structure (hierarchical)")
 		fmt.Println("  torture   Create flat directories with massive file counts")
+		fmt.Println("  deep      Create narrow-deep directory chain (for recursion testing)")
 		fmt.Println("  update    Run dynamic changes (for cron jobs)")
 		fmt.Println("")
 		fmt.Println("Options:")
@@ -890,13 +1000,18 @@ func main() {
 			fmt.Printf("FATAL TORTURE ERROR: %v\n", err)
 			os.Exit(1)
 		}
+	case "deep":
+		if err := populateDeep(); err != nil {
+			fmt.Printf("FATAL DEEP ERROR: %v\n", err)
+			os.Exit(1)
+		}
 	case "update":
 		if err := runDynamicUpdate(); err != nil {
 			fmt.Printf("FATAL UPDATE ERROR: %v\n", err)
 			os.Exit(1)
 		}
 	default:
-		fmt.Printf("Invalid mode: %s. Use 'populate', 'torture', or 'update'.\n", mode)
+		fmt.Printf("Invalid mode: %s. Use 'populate', 'torture', 'deep', or 'update'.\n", mode)
 		os.Exit(1)
 	}
 }

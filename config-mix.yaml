@@ -1,0 +1,39 @@
+# Benchmark: Realistic Mix
+# 500K files across 10K directories
+# Tests: Production-like traversal patterns
+
+base_dir: "/mnt/syncengine-demo/bench/mix"
+log_file: "/tmp/fs_sim_mix.log"
+
+target_dirs: 10000
+target_files: 500000
+
+# Moderate depth, typical project structure
+max_depth: 5
+max_subdirs_per_dir: 20
+
+# Small files (4KB avg) like source code
+file_size:
+  min_normal: 1024
+  max_normal: 8192
+  large_file_chance: 0
+  min_large: 1024
+  max_large: 1024
+
+workers: 64
+
+# Single category
+file_extensions:
+  projects:
+    - ".dat"
+
+min_file_age: 1640995200
+max_file_age: 0
+uids: [1000]
+gids: [1000]
+action_weights:
+  create_file: 0
+  delete_file: 0
+  append_file: 0
+  change_metadata: 0
+  touch_file: 0

@@ -1,0 +1,40 @@
+# Benchmark: Wide-Shallow
+# 1M files across 1K directories, depth=2
+# Tests: Parallelism, READDIRPLUS efficiency
+
+base_dir: "/mnt/syncengine-demo/bench/wide-shallow"
+log_file: "/tmp/fs_sim_wide.log"
+
+target_dirs: 1000
+target_files: 1000000
+
+# Shallow structure
+max_depth: 1
+max_subdirs_per_dir: 1000
+
+# Minimal file size (1KB) - we're testing metadata ops, not data
+file_size:
+  min_normal: 1024
+  max_normal: 1024
+  large_file_chance: 0
+  min_large: 1024
+  max_large: 1024
+
+workers: 64
+
+# Single category so all dirs are under one parent
+file_extensions:
+  benchmark:
+    - ".dat"
+
+# Dummy values (required)
+min_file_age: 1640995200
+max_file_age: 0
+uids: [1000]
+gids: [1000]
+action_weights:
+  create_file: 0
+  delete_file: 0
+  append_file: 0
+  change_metadata: 0
+  touch_file: 0

@@ -1,0 +1,22 @@
+# Benchmark: Narrow-Deep
+# 1000 levels deep × 10 files per level = 10K files
+# Tests: Stack/queue management, recursion, path handling overhead
+
+base_dir: "/mnt/syncengine-demo/bench/narrow-deep"
+log_file: "/tmp/fs_sim_deep.log"
+
+workers: 1  # Not used in deep mode, but required
+
+# Dummy values (required by config parser)
+file_extensions:
+  data:
+    - ".dat"
+uids: [1000]
+gids: [1000]
+
+deep:
+  depth: 1000
+  files_per_level: 10
+  file_size_bytes: 1024
+  skip_metadata: true
+  report_interval: 100
