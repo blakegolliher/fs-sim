@@ -148,9 +148,10 @@ func setMetadata(path string, isDir bool) error {
 	}
 	os.Chmod(path, mode)
 
-	// 3. Set Historical Access/Modification Times
-	randTime := getRandomTime()
-	os.Chtimes(path, randTime, randTime)
+	// 3. Set Historical Access/Modification Times (independent atime and mtime)
+	atime := getRandomTime()
+	mtime := getRandomTime()
+	os.Chtimes(path, atime, mtime)
 
 	return nil
 }
@@ -618,8 +619,8 @@ func populateDeep() error {
 	totalFiles := 0
 
 	for level := 1; level <= cfg.Deep.Depth; level++ {
-		// Create directory for this level
-		dirName := fmt.Sprintf("level_%04d", level)
+		// Create directory for this level (short name to avoid PATH_MAX)
+		dirName := fmt.Sprintf("l%03d", level)
 		currentPath = filepath.Join(currentPath, dirName)
 
 		if err := os.Mkdir(currentPath, 0755); err != nil {
@@ -630,9 +631,9 @@ func populateDeep() error {
 			setMetadata(currentPath, true)
 		}
 
-		// Create files at this level
+		// Create files at this level (short name to avoid PATH_MAX)
 		for f := 1; f <= cfg.Deep.FilesPerLevel; f++ {
-			fileName := fmt.Sprintf("file_%04d.dat", f)
+			fileName := fmt.Sprintf("f%03d.dat", f)
 			filePath := filepath.Join(currentPath, fileName)
 
 			file, err := os.Create(filePath)

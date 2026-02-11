@@ -1,6 +1,7 @@
 # Benchmark: Narrow-Deep
-# 1000 levels deep × 10 files per level = 10K files
+# 700 levels deep × 10 files per level = 7K files
 # Tests: Stack/queue management, recursion, path handling overhead
+# Note: Limited to ~700 levels due to PATH_MAX (4096 bytes)
 
 base_dir: "/mnt/syncengine-demo/bench/narrow-deep"
 log_file: "/tmp/fs_sim_deep.log"
@@ -15,7 +16,7 @@ uids: [1000]
 gids: [1000]
 
 deep:
-  depth: 1000
+  depth: 700
   files_per_level: 10
   file_size_bytes: 1024
   skip_metadata: true
