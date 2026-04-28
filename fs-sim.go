@@ -290,10 +290,53 @@ type FileJob struct {
 	FileNum  int
 }
 
+// estimateDirCount returns (avgEstimate, maxPossible) directory counts the
+// BFS tree-build can reach for the given top-level count, max_subdirs_per_dir,
+// and max_depth — clamped to TargetDirs. Each parent generates rand.IntN(K+1)
+// children, so the average fanout is K/2 (rounded down, min 1 when K>=1).
+func estimateDirCount(topLevel, maxSubdirs, maxDepth int, target int64) (int64, int64) {
+	if topLevel <= 0 || maxDepth <= 0 {
+		return int64(topLevel), int64(topLevel)
+	}
+	avgK := int64(maxSubdirs / 2)
+	if avgK < 1 && maxSubdirs >= 1 {
+		avgK = 1
+	}
+	maxK := int64(maxSubdirs)
+
+	avgTotal := int64(topLevel)
+	maxTotal := int64(topLevel)
+	avgLevel := int64(topLevel)
+	maxLevel := int64(topLevel)
+	const cap = int64(1) << 60
+	for level := 1; level < maxDepth; level++ {
+		avgLevel *= avgK
+		maxLevel *= maxK
+		if avgLevel > cap {
+			avgLevel = cap
+		}
+		if maxLevel > cap {
+			maxLevel = cap
+		}
+		avgTotal += avgLevel
+		maxTotal += maxLevel
+		if avgTotal > target && maxTotal > target {
+			break
+		}
+	}
+	if avgTotal > target {
+		avgTotal = target
+	}
+	if maxTotal > target {
+		maxTotal = target
+	}
+	return avgTotal, maxTotal
+}
+
 // populateFilesystem creates the initial directory structure and files
 func populateFilesystem() error {
 	fmt.Println("--- Starting initial filesystem population ---")
-	fmt.Printf("Target: %d files, %d directories\n", cfg.TargetFiles, cfg.TargetDirs)
+	fmt.Printf("Targets: %d files, up to %d directories\n", cfg.TargetFiles, cfg.TargetDirs)
 	fmt.Printf("Base directory: %s\n", cfg.BaseDir)
 	fmt.Printf("Workers: %d\n", cfg.Workers)
 	startTime := time.Now()
@@ -307,6 +350,17 @@ func populateFilesystem() error {
 	topLevelDirs := make([]string, 0, len(cfg.FileExtensions))
 	for dir := range cfg.FileExtensions {
 		topLevelDirs = append(topLevelDirs, dir)
+	}
+
+	// Tell the user up front what tree shape can actually produce, so a
+	// target_dirs that exceeds the achievable maximum is obvious before
+	// Phase 1 begins.
+	avgEst, maxEst := estimateDirCount(len(topLevelDirs), cfg.MaxSubdirsPerDir, cfg.MaxDepth, int64(cfg.TargetDirs))
+	fmt.Printf("Tree shape: max_depth=%d, max_subdirs_per_dir=%d, top-level=%d -> ~%d dirs avg, %d dirs max\n",
+		cfg.MaxDepth, cfg.MaxSubdirsPerDir, len(topLevelDirs), avgEst, maxEst)
+	if int64(cfg.TargetDirs) > maxEst {
+		fmt.Printf("NOTE: target_dirs=%d exceeds the achievable max (%d). Increase max_depth or max_subdirs_per_dir to grow more dirs.\n",
+			cfg.TargetDirs, maxEst)
 	}
 
 	// Create top-level directories
@@ -387,7 +441,12 @@ func populateFilesystem() error {
 	if currentDirs > cfg.TargetDirs {
 		currentDirs = cfg.TargetDirs
 	}
-	fmt.Printf("Phase 1 complete: %d directories created\n", currentDirs)
+	if currentDirs < cfg.TargetDirs {
+		fmt.Printf("Phase 1 complete: %d directories created (below target %d - tree shape capped growth at depth %d)\n",
+			currentDirs, cfg.TargetDirs, cfg.MaxDepth)
+	} else {
+		fmt.Printf("Phase 1 complete: %d directories created\n", currentDirs)
+	}
 
 	// Phase 2: Create files in parallel
 	fmt.Println("Phase 2: Creating files with parallel workers...")
