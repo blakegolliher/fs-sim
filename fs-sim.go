@@ -433,7 +433,8 @@ func populateFilesystem() error {
 		dirWg.Wait()
 
 		allDirs = append(allDirs, nextLevel...)
-		fmt.Printf("  Depth %d: %d directories total\n", parentDepth+1, totalDirs.Load())
+		fmt.Printf("  [%s] Depth %d: %d directories total\n",
+			time.Now().Format("2006-01-02 15:04:05"), parentDepth+1, totalDirs.Load())
 		currentLevel = nextLevel
 	}
 
@@ -523,7 +524,8 @@ func populateFilesystem() error {
 				if count%100000 == 0 {
 					elapsed := time.Since(startTime)
 					rate := float64(count) / elapsed.Seconds()
-					fmt.Printf("  Progress: %d files (%.0f files/sec)\n", count, rate)
+					fmt.Printf("  [%s] Progress: %d files (%.0f files/sec)\n",
+						time.Now().Format("2006-01-02 15:04:05"), count, rate)
 				}
 			}
 			if len(batch) > 0 {
@@ -675,7 +677,8 @@ func populateTorture() error {
 							elapsed := time.Since(dirStartTime)
 							rate := float64(count) / elapsed.Seconds()
 							pct := float64(count) / float64(cfg.Torture.FilesPerDir) * 100
-							fmt.Printf("  Progress: %d files (%.1f%%) - %.0f files/sec\n", count, pct, rate)
+							fmt.Printf("  [%s] Progress: %d files (%.1f%%) - %.0f files/sec\n",
+								time.Now().Format("2006-01-02 15:04:05"), count, pct, rate)
 						}
 					}
 				}
