@@ -69,6 +69,27 @@ type Config struct {
 // Global config
 var cfg Config
 
+// Metadata fast-path flags, computed once after config load.
+var (
+	// metaSkipChown is true when we're not euid 0 — chown would silently fail,
+	// so skip the syscall entirely.
+	metaSkipChown bool
+	// metaSingleUID/metaSingleGID short-circuit getRandomID lookups.
+	metaSingleUID bool
+	metaSingleGID bool
+	// metaTimeRange caches MaxFileAge - MinFileAge (0 means "use time.Now()").
+	metaTimeRange int64
+)
+
+func initMetadataFastPath() {
+	metaSkipChown = os.Geteuid() != 0
+	metaSingleUID = len(cfg.UIDs) == 1
+	metaSingleGID = len(cfg.GIDs) == 1
+	if cfg.MaxFileAge > cfg.MinFileAge {
+		metaTimeRange = cfg.MaxFileAge - cfg.MinFileAge
+	}
+}
+
 // loadConfig reads and parses the YAML configuration file
 func loadConfig(path string) error {
 	data, err := os.ReadFile(path)
@@ -107,6 +128,7 @@ func loadConfig(path string) error {
 		return fmt.Errorf("file_extensions must be defined in config")
 	}
 
+	initMetadataFastPath()
 	return nil
 }
 
@@ -115,34 +137,51 @@ func getRandomID(ids []int) int {
 	return ids[rand.IntN(len(ids))]
 }
 
-// getRandomPerms selects a random file or directory permission mode
+// getRandomPerms selects a random file permission mode.
 func getRandomPerms() os.FileMode {
 	perms := []os.FileMode{0755, 0644, 0770, 0400, 0666, 0555}
 	return perms[rand.IntN(len(perms))]
 }
 
-// getRandomTime generates a random time between MinFileAge and MaxFileAge
-func getRandomTime() time.Time {
-	if cfg.MaxFileAge <= cfg.MinFileAge {
-		return time.Now()
-	}
-	randSec := rand.Int64N(cfg.MaxFileAge-cfg.MinFileAge) + cfg.MinFileAge
-	return time.Unix(randSec, 0)
+// getRandomDirPerms selects a random directory permission mode. Unlike file
+// perms, dir perms always include owner rwx (0700) so subsequent children
+// can be created inside.
+func getRandomDirPerms() os.FileMode {
+	perms := []os.FileMode{0755, 0775, 0770, 0750, 0700, 0777}
+	return perms[rand.IntN(len(perms))]
 }
 
-// setMetadata sets random ownership, permissions, and historical atime/mtime
-func setMetadata(path string, isDir bool) error {
-	uid := getRandomID(cfg.UIDs)
-	gid := getRandomID(cfg.GIDs)
+// getRandomTime generates a random time between MinFileAge and MaxFileAge.
+// Uses the precomputed metaTimeRange to skip subtraction per call.
+func getRandomTime() time.Time {
+	if metaTimeRange == 0 {
+		return time.Now()
+	}
+	return time.Unix(rand.Int64N(metaTimeRange)+cfg.MinFileAge, 0)
+}
 
-	// 1. Set Owner/Group (ignore errors, may not be root)
-	os.Chown(path, uid, gid)
+// setMetadata sets random ownership, permissions, and historical atime/mtime.
+// Uses precomputed fast-path flags to skip syscalls that would fail or are
+// no-ops (e.g. chown when not running as root).
+func setMetadata(path string, isDir bool) error {
+	// 1. Set Owner/Group — skip entirely when not root since it would just
+	// silently fail. Avoid getRandomID when there's only one uid/gid.
+	if !metaSkipChown {
+		uid := cfg.UIDs[0]
+		if !metaSingleUID {
+			uid = getRandomID(cfg.UIDs)
+		}
+		gid := cfg.GIDs[0]
+		if !metaSingleGID {
+			gid = getRandomID(cfg.GIDs)
+		}
+		os.Chown(path, uid, gid)
+	}
 
 	// 2. Set Permissions
 	var mode os.FileMode
 	if isDir {
-		baseMode := getRandomPerms()
-		mode = baseMode | 0100
+		mode = getRandomDirPerms()
 	} else {
 		mode = getRandomPerms()
 	}
@@ -176,40 +215,51 @@ func NewFastRandom(size int) *FastRandom {
 }
 
 // Fill fills the destination slice with random bytes from the buffer
+// using copy() instead of a per-byte loop.
 func (fr *FastRandom) Fill(dst []byte) {
-	for i := range dst {
-		dst[i] = fr.buffer[fr.pos]
-		fr.pos = (fr.pos + 1) % len(fr.buffer)
+	bufLen := len(fr.buffer)
+	remaining := len(dst)
+	written := 0
+	for remaining > 0 {
+		if fr.pos >= bufLen {
+			fr.pos = 0
+		}
+		n := copy(dst[written:], fr.buffer[fr.pos:])
+		fr.pos += n
+		written += n
+		remaining -= n
 	}
 }
 
-// writeRandomDataFast writes random bytes using pre-generated buffer
-func writeRandomDataFast(filePath string, size int, fr *FastRandom) error {
+// writeRandomDataFast writes random bytes using a caller-supplied reusable
+// chunk buffer. Files that fit in the chunk get a single fill+write; larger
+// files are written in chunk-sized pieces.
+func writeRandomDataFast(filePath string, size int, fr *FastRandom, chunk []byte) error {
 	f, err := os.Create(filePath)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
 
-	writer := bufio.NewWriterSize(f, 64*1024)
+	if size <= len(chunk) {
+		fr.Fill(chunk[:size])
+		_, err := f.Write(chunk[:size])
+		return err
+	}
 
-	const chunkSize = 64 * 1024
-	chunk := make([]byte, chunkSize)
 	remaining := size
-
 	for remaining > 0 {
-		writeSize := chunkSize
-		if remaining < chunkSize {
+		writeSize := len(chunk)
+		if remaining < writeSize {
 			writeSize = remaining
 		}
 		fr.Fill(chunk[:writeSize])
-		if _, err := writer.Write(chunk[:writeSize]); err != nil {
+		if _, err := f.Write(chunk[:writeSize]); err != nil {
 			return err
 		}
 		remaining -= writeSize
 	}
-
-	return writer.Flush()
+	return nil
 }
 
 // getExtensionForCategory returns a random file extension for the given category
@@ -268,46 +318,75 @@ func populateFilesystem() error {
 		setMetadata(path, true)
 	}
 
-	// Phase 1: Create all directories first (single-threaded for simplicity)
-	fmt.Println("Phase 1: Creating directory structure...")
+	// Phase 1: Create all directories in parallel, level-by-level (BFS).
+	// At each depth, parents are processed concurrently by cfg.Workers
+	// goroutines, each calling os.Mkdir + setMetadata.
+	fmt.Println("Phase 1: Creating directory structure (parallel)...")
 	allDirs := make([]string, 0, cfg.TargetDirs)
-
-	// Start with top-level dirs
 	for _, dir := range topLevelDirs {
 		allDirs = append(allDirs, filepath.Join(cfg.BaseDir, dir))
 	}
 
-	dirIndex := 0
-	currentDirs := len(topLevelDirs)
+	var totalDirs atomic.Int64
+	totalDirs.Store(int64(len(topLevelDirs)))
+	target := int64(cfg.TargetDirs)
 
-	for currentDirs < cfg.TargetDirs && dirIndex < len(allDirs) {
-		parentDir := allDirs[dirIndex]
-		dirIndex++
+	currentLevel := make([]string, len(allDirs))
+	copy(currentLevel, allDirs)
 
-		// Determine depth based on path
-		depth := strings.Count(parentDir, string(os.PathSeparator)) - strings.Count(cfg.BaseDir, string(os.PathSeparator))
-		if depth >= cfg.MaxDepth {
-			continue
+	for parentDepth := 1; parentDepth < cfg.MaxDepth && totalDirs.Load() < target && len(currentLevel) > 0; parentDepth++ {
+		parents := make(chan string, len(currentLevel))
+		for _, p := range currentLevel {
+			parents <- p
 		}
+		close(parents)
 
-		numSubDirs := rand.IntN(cfg.MaxSubdirsPerDir + 1)
-		for i := 0; i < numSubDirs && currentDirs < cfg.TargetDirs; i++ {
-			dirName := fmt.Sprintf("d_%03d_%d", rand.IntN(999), currentDirs)
-			newDirPath := filepath.Join(parentDir, dirName)
+		var nextLevel []string
+		var nextMu sync.Mutex
+		var dirWg sync.WaitGroup
 
-			if err := os.Mkdir(newDirPath, 0755); err != nil {
-				continue
-			}
-			setMetadata(newDirPath, true)
-			allDirs = append(allDirs, newDirPath)
-			currentDirs++
-
-			if currentDirs%10000 == 0 {
-				fmt.Printf("  Directories: %d/%d\n", currentDirs, cfg.TargetDirs)
-			}
+		for w := 0; w < cfg.Workers; w++ {
+			dirWg.Add(1)
+			go func() {
+				defer dirWg.Done()
+				local := make([]string, 0, 256)
+				for parentDir := range parents {
+					if totalDirs.Load() >= target {
+						continue
+					}
+					numSubDirs := rand.IntN(cfg.MaxSubdirsPerDir + 1)
+					for i := 0; i < numSubDirs; i++ {
+						counter := totalDirs.Add(1)
+						if counter > target {
+							break
+						}
+						dirName := fmt.Sprintf("d_%03d_%d", rand.IntN(999), counter)
+						newDirPath := filepath.Join(parentDir, dirName)
+						if err := os.Mkdir(newDirPath, 0755); err != nil {
+							continue
+						}
+						setMetadata(newDirPath, true)
+						local = append(local, newDirPath)
+					}
+				}
+				if len(local) > 0 {
+					nextMu.Lock()
+					nextLevel = append(nextLevel, local...)
+					nextMu.Unlock()
+				}
+			}()
 		}
+		dirWg.Wait()
+
+		allDirs = append(allDirs, nextLevel...)
+		fmt.Printf("  Depth %d: %d directories total\n", parentDepth+1, totalDirs.Load())
+		currentLevel = nextLevel
 	}
 
+	currentDirs := int(totalDirs.Load())
+	if currentDirs > cfg.TargetDirs {
+		currentDirs = cfg.TargetDirs
+	}
 	fmt.Printf("Phase 1 complete: %d directories created\n", currentDirs)
 
 	// Phase 2: Create files in parallel
@@ -315,8 +394,9 @@ func populateFilesystem() error {
 
 	// Channel for file jobs
 	jobs := make(chan FileJob, cfg.Workers*100)
-	// Channel for completed file paths (for logging)
-	results := make(chan string, cfg.Workers*100)
+	// Channel for completed file path batches (for logging).
+	// Batching cuts per-file channel send overhead by ~256x.
+	results := make(chan []string, cfg.Workers*4)
 	// Done channel
 	done := make(chan struct{})
 
@@ -335,21 +415,28 @@ func populateFilesystem() error {
 		}
 		defer logFile.Close()
 
-		writer := bufio.NewWriterSize(logFile, 256*1024)
-		for path := range results {
-			writer.WriteString(path + "\n")
+		writer := bufio.NewWriterSize(logFile, 1024*1024)
+		for batch := range results {
+			for _, path := range batch {
+				writer.WriteString(path)
+				writer.WriteByte('\n')
+			}
 		}
 		writer.Flush()
 		close(done)
 	}()
 
 	// Start worker goroutines
+	const logBatchSize = 256
 	for w := 0; w < cfg.Workers; w++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			// Each worker gets its own fast random generator (1MB buffer)
+			// and a reusable write chunk to avoid per-file allocations.
 			fr := NewFastRandom(1024 * 1024)
+			chunk := make([]byte, 64*1024)
+			batch := make([]string, 0, logBatchSize)
 
 			for job := range jobs {
 				ext := getExtensionForCategory(job.Category)
@@ -362,12 +449,16 @@ func populateFilesystem() error {
 					fileSize = rand.IntN(cfg.FileSize.MaxLarge-cfg.FileSize.MinLarge+1) + cfg.FileSize.MinLarge
 				}
 
-				if err := writeRandomDataFast(filePath, fileSize, fr); err != nil {
+				if err := writeRandomDataFast(filePath, fileSize, fr, chunk); err != nil {
 					continue
 				}
 				setMetadata(filePath, false)
 
-				results <- filePath
+				batch = append(batch, filePath)
+				if len(batch) >= logBatchSize {
+					results <- batch
+					batch = make([]string, 0, logBatchSize)
+				}
 
 				count := fileCount.Add(1)
 				if count%100000 == 0 {
@@ -375,6 +466,9 @@ func populateFilesystem() error {
 					rate := float64(count) / elapsed.Seconds()
 					fmt.Printf("  Progress: %d files (%.0f files/sec)\n", count, rate)
 				}
+			}
+			if len(batch) > 0 {
+				results <- batch
 			}
 		}()
 	}
@@ -846,7 +940,8 @@ func createNewFile(idx *FileIndex) error {
 	fileSize := rand.IntN(9216) + 1024
 
 	fr := NewFastRandom(64 * 1024)
-	if err := writeRandomDataFast(filePath, fileSize, fr); err != nil {
+	chunk := make([]byte, 64*1024)
+	if err := writeRandomDataFast(filePath, fileSize, fr, chunk); err != nil {
 		return fmt.Errorf("failed to write new file %s: %w", filePath, err)
 	}
 
