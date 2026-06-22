@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"math/rand/v2"
@@ -49,20 +50,20 @@ type Config struct {
 
 	// Torture mode config - for creating flat directories with massive file counts
 	Torture struct {
-		FlatDirs       []string `yaml:"flat_dirs"`        // List of flat directory names to create
-		FilesPerDir    int64    `yaml:"files_per_dir"`    // Number of files per flat directory
-		FileSizeBytes  int      `yaml:"file_size_bytes"`  // Fixed file size in bytes
-		SkipMetadata   bool     `yaml:"skip_metadata"`    // Skip chown/chmod for speed
-		ReportInterval int64    `yaml:"report_interval"`  // Progress report every N files
+		FlatDirs       []string `yaml:"flat_dirs"`       // List of flat directory names to create
+		FilesPerDir    int64    `yaml:"files_per_dir"`   // Number of files per flat directory
+		FileSizeBytes  int      `yaml:"file_size_bytes"` // Fixed file size in bytes
+		SkipMetadata   bool     `yaml:"skip_metadata"`   // Skip chown/chmod for speed
+		ReportInterval int64    `yaml:"report_interval"` // Progress report every N files
 	} `yaml:"torture"`
 
 	// Deep mode config - for creating narrow-deep directory chains
 	Deep struct {
-		Depth          int  `yaml:"depth"`            // Number of nested directory levels
-		FilesPerLevel  int  `yaml:"files_per_level"`  // Number of files at each level
-		FileSizeBytes  int  `yaml:"file_size_bytes"`  // Fixed file size in bytes
-		SkipMetadata   bool `yaml:"skip_metadata"`    // Skip chown/chmod for speed
-		ReportInterval int  `yaml:"report_interval"`  // Progress report every N levels
+		Depth          int  `yaml:"depth"`           // Number of nested directory levels
+		FilesPerLevel  int  `yaml:"files_per_level"` // Number of files at each level
+		FileSizeBytes  int  `yaml:"file_size_bytes"` // Fixed file size in bytes
+		SkipMetadata   bool `yaml:"skip_metadata"`   // Skip chown/chmod for speed
+		ReportInterval int  `yaml:"report_interval"` // Progress report every N levels
 	} `yaml:"deep"`
 }
 
@@ -137,18 +138,37 @@ func getRandomID(ids []int) int {
 	return ids[rand.IntN(len(ids))]
 }
 
-// getRandomPerms selects a random file permission mode.
-func getRandomPerms() os.FileMode {
-	perms := []os.FileMode{0755, 0644, 0770, 0400, 0666, 0555}
-	return perms[rand.IntN(len(perms))]
+// topLevelDirNames returns the top-level directory names, which are the keys
+// of the file_extensions config.
+func topLevelDirNames() []string {
+	dirs := make([]string, 0, len(cfg.FileExtensions))
+	for dir := range cfg.FileExtensions {
+		dirs = append(dirs, dir)
+	}
+	return dirs
 }
 
-// getRandomDirPerms selects a random directory permission mode. Unlike file
-// perms, dir perms always include owner rwx (0700) so subsequent children
-// can be created inside.
+// nowStamp returns the current time formatted for progress lines.
+func nowStamp() string {
+	return time.Now().Format("2006-01-02 15:04:05")
+}
+
+// fileModes / dirModes are the permission sets randomly assigned to files and
+// directories. Dir perms always include owner rwx (0700) so subsequent
+// children can be created inside.
+var (
+	fileModes = []os.FileMode{0755, 0644, 0770, 0400, 0666, 0555}
+	dirModes  = []os.FileMode{0755, 0775, 0770, 0750, 0700, 0777}
+)
+
+// getRandomPerms selects a random file permission mode.
+func getRandomPerms() os.FileMode {
+	return fileModes[rand.IntN(len(fileModes))]
+}
+
+// getRandomDirPerms selects a random directory permission mode.
 func getRandomDirPerms() os.FileMode {
-	perms := []os.FileMode{0755, 0775, 0770, 0750, 0700, 0777}
-	return perms[rand.IntN(len(perms))]
+	return dirModes[rand.IntN(len(dirModes))]
 }
 
 // getRandomTime generates a random time between MinFileAge and MaxFileAge.
@@ -162,8 +182,9 @@ func getRandomTime() time.Time {
 
 // setMetadata sets random ownership, permissions, and historical atime/mtime.
 // Uses precomputed fast-path flags to skip syscalls that would fail or are
-// no-ops (e.g. chown when not running as root).
-func setMetadata(path string, isDir bool) error {
+// no-ops (e.g. chown when not running as root). Best-effort: individual
+// syscall errors are intentionally ignored.
+func setMetadata(path string, isDir bool) {
 	// 1. Set Owner/Group — skip entirely when not root since it would just
 	// silently fail. Avoid getRandomID when there's only one uid/gid.
 	if !metaSkipChown {
@@ -191,8 +212,6 @@ func setMetadata(path string, isDir bool) error {
 	atime := getRandomTime()
 	mtime := getRandomTime()
 	os.Chtimes(path, atime, mtime)
-
-	return nil
 }
 
 // FastRandom provides fast random byte generation using a pre-filled buffer
@@ -347,10 +366,7 @@ func populateFilesystem() error {
 	}
 
 	// Get top-level directory names from file extensions config
-	topLevelDirs := make([]string, 0, len(cfg.FileExtensions))
-	for dir := range cfg.FileExtensions {
-		topLevelDirs = append(topLevelDirs, dir)
-	}
+	topLevelDirs := topLevelDirNames()
 
 	// Tell the user up front what tree shape can actually produce, so a
 	// target_dirs that exceeds the achievable maximum is obvious before
@@ -434,7 +450,7 @@ func populateFilesystem() error {
 
 		allDirs = append(allDirs, nextLevel...)
 		fmt.Printf("  [%s] Depth %d: %d directories total\n",
-			time.Now().Format("2006-01-02 15:04:05"), parentDepth+1, totalDirs.Load())
+			nowStamp(), parentDepth+1, totalDirs.Load())
 		currentLevel = nextLevel
 	}
 
@@ -525,7 +541,7 @@ func populateFilesystem() error {
 					elapsed := time.Since(startTime)
 					rate := float64(count) / elapsed.Seconds()
 					fmt.Printf("  [%s] Progress: %d files (%.0f files/sec)\n",
-						time.Now().Format("2006-01-02 15:04:05"), count, rate)
+						nowStamp(), count, rate)
 				}
 			}
 			if len(batch) > 0 {
@@ -678,7 +694,7 @@ func populateTorture() error {
 							rate := float64(count) / elapsed.Seconds()
 							pct := float64(count) / float64(cfg.Torture.FilesPerDir) * 100
 							fmt.Printf("  [%s] Progress: %d files (%.1f%%) - %.0f files/sec\n",
-								time.Now().Format("2006-01-02 15:04:05"), count, pct, rate)
+								nowStamp(), count, pct, rate)
 						}
 					}
 				}
@@ -977,9 +993,7 @@ func changeMetadata(idx *FileIndex) error {
 		return err
 	}
 
-	if err := setMetadata(filePath, false); err != nil {
-		return fmt.Errorf("failed to change metadata for %s: %w", filePath, err)
-	}
+	setMetadata(filePath, false)
 
 	fmt.Printf("METADATA CHANGED: %s\n", filePath)
 	return nil
@@ -987,10 +1001,7 @@ func changeMetadata(idx *FileIndex) error {
 
 // createNewFile adds a new file to a random directory
 func createNewFile(idx *FileIndex) error {
-	topLevelDirs := make([]string, 0, len(cfg.FileExtensions))
-	for dir := range cfg.FileExtensions {
-		topLevelDirs = append(topLevelDirs, dir)
-	}
+	topLevelDirs := topLevelDirNames()
 
 	dirName := topLevelDirs[rand.IntN(len(topLevelDirs))]
 	targetDir := filepath.Join(cfg.BaseDir, dirName)
@@ -1007,9 +1018,7 @@ func createNewFile(idx *FileIndex) error {
 		return fmt.Errorf("failed to write new file %s: %w", filePath, err)
 	}
 
-	if err := setMetadata(filePath, false); err != nil {
-		fmt.Printf("Warning: Failed to set metadata on new file: %v\n", err)
-	}
+	setMetadata(filePath, false)
 
 	logFile, err := os.OpenFile(cfg.LogFile, os.O_APPEND|os.O_WRONLY, 0644)
 	if err == nil {
@@ -1088,19 +1097,23 @@ func runDynamicUpdate() error {
 			r := rand.IntN(totalWeight)
 			cumulativeWeight := 0
 			var chosenAction actionFunc
+			var chosenName string
 
 			for _, action := range actions {
 				cumulativeWeight += action.weight
 				if r < cumulativeWeight {
 					chosenAction = action.f
+					chosenName = action.name
 					break
 				}
 			}
 
 			if chosenAction != nil {
 				if err := chosenAction(idx); err != nil {
-					if !os.IsNotExist(err) && !strings.Contains(err.Error(), "no such file") {
-						fmt.Printf("Action failed: %v\n", err)
+					// A file vanishing between selection and use is expected
+					// churn, not an error worth reporting.
+					if !errors.Is(err, os.ErrNotExist) {
+						fmt.Printf("Action failed (%s): %v\n", chosenName, err)
 						errorCount++
 					}
 				} else {
