@@ -72,6 +72,10 @@ type Config struct {
 // Global config
 var cfg Config
 
+// version is stamped at release build time via
+// -ldflags "-X main.version=vX.Y.Z"; source builds report "dev".
+var version = "dev"
+
 // Metadata fast-path flags, computed once after config load.
 var (
 	// metaSkipChown is true when we're not euid 0 — chown would silently fail,
@@ -1339,16 +1343,24 @@ func runDynamicUpdate() error {
 func main() {
 	var configPath string
 	var mode string
+	var showVersion bool
 
 	flag.StringVar(&configPath, "config", "config.yaml", "Path to configuration file")
 	flag.StringVar(&mode, "mode", "", "Mode: populate or update")
+	flag.BoolVar(&showVersion, "version", false, "Print version and exit")
 	flag.Parse()
+
+	if showVersion {
+		fmt.Printf("fs-sim %s\n", version)
+		return
+	}
 
 	if mode == "" && flag.NArg() > 0 {
 		mode = strings.ToLower(flag.Arg(0))
 	}
 
 	if mode == "" {
+		fmt.Printf("fs-sim %s\n\n", version)
 		fmt.Println("Usage: fs-sim [--config config.yaml] <mode>")
 		fmt.Println("       fs-sim --mode=<mode> [--config=config.yaml]")
 		fmt.Println("")

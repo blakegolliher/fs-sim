@@ -10,6 +10,19 @@ A high-performance tool for generating and dynamically updating a simulated file
 - Assigns random UIDs/GIDs and historical timestamps
 - Dynamic update mode for ongoing filesystem changes
 
+## Download
+
+Prebuilt static binaries are on the [releases page](https://github.com/blakegolliher/fs-sim/releases) (Linux x86_64/arm64, macOS Intel/Apple Silicon):
+
+```bash
+curl -LO https://github.com/blakegolliher/fs-sim/releases/latest/download/fs-sim-linux-amd64
+curl -LO https://github.com/blakegolliher/fs-sim/releases/latest/download/config-quickstart.yaml
+chmod +x fs-sim-linux-amd64
+
+# edit base_dir in config-quickstart.yaml to point at your mount, then:
+./fs-sim-linux-amd64 --config=config-quickstart.yaml populate
+```
+
 ## Usage
 
 ### Build
