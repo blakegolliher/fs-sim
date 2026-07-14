@@ -1,0 +1,2 @@
+# build artifact (rebuild with: go build -o fs-sim fs-sim.go)
+/fs-sim

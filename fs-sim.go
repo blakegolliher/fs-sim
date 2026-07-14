@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/binary"
 	"errors"
 	"flag"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -86,6 +88,7 @@ func initMetadataFastPath() {
 	metaSkipChown = os.Geteuid() != 0
 	metaSingleUID = len(cfg.UIDs) == 1
 	metaSingleGID = len(cfg.GIDs) == 1
+	metaTimeRange = 0
 	if cfg.MaxFileAge > cfg.MinFileAge {
 		metaTimeRange = cfg.MaxFileAge - cfg.MinFileAge
 	}
@@ -107,12 +110,28 @@ func loadConfig(path string) error {
 		cfg.MaxFileAge = time.Now().Unix()
 	}
 
-	// Set default workers to CPU count if not specified
+	// Default workers: file creation against NFS is latency-bound, not
+	// CPU-bound, so auto mode oversubscribes the cores. Explicit workers
+	// in the config always wins.
 	if cfg.Workers <= 0 {
-		cfg.Workers = runtime.NumCPU()
+		cfg.Workers = runtime.NumCPU() * 4
+		if cfg.Workers > 256 {
+			cfg.Workers = 256
+		}
 	}
 
-	// Validate required fields
+	if err := validateConfig(); err != nil {
+		return err
+	}
+
+	initMetadataFastPath()
+	return nil
+}
+
+// validateConfig checks required fields and rejects value combinations that
+// would panic mid-run (e.g. rand.IntN with a non-positive span) — a crash
+// hours into a 200M-file populate is expensive.
+func validateConfig() error {
 	if cfg.BaseDir == "" {
 		return fmt.Errorf("base_dir is required in config")
 	}
@@ -128,8 +147,22 @@ func loadConfig(path string) error {
 	if len(cfg.FileExtensions) == 0 {
 		return fmt.Errorf("file_extensions must be defined in config")
 	}
-
-	initMetadataFastPath()
+	if cfg.MaxSubdirsPerDir < 0 {
+		return fmt.Errorf("max_subdirs_per_dir must be >= 0")
+	}
+	fs := cfg.FileSize
+	if fs.MinNormal < 0 || fs.MaxNormal < fs.MinNormal {
+		return fmt.Errorf("file_size: need 0 <= min_normal <= max_normal (got %d..%d)", fs.MinNormal, fs.MaxNormal)
+	}
+	if fs.LargeFileChance < 0 {
+		return fmt.Errorf("file_size: large_file_chance must be >= 0")
+	}
+	if fs.LargeFileChance > 0 && (fs.MinLarge < 0 || fs.MaxLarge < fs.MinLarge) {
+		return fmt.Errorf("file_size: need 0 <= min_large <= max_large when large_file_chance > 0 (got %d..%d)", fs.MinLarge, fs.MaxLarge)
+	}
+	if cfg.Torture.FileSizeBytes < 0 {
+		return fmt.Errorf("torture.file_size_bytes must be >= 0")
+	}
 	return nil
 }
 
@@ -171,35 +204,76 @@ func getRandomDirPerms() os.FileMode {
 	return dirModes[rand.IntN(len(dirModes))]
 }
 
+// createModeFor returns the mode to pass to open(O_CREAT) for a target file
+// mode, and whether a follow-up chmod is required. Owner-writable modes are
+// baked into the create itself (no SETATTR round-trip); non-owner-writable
+// modes (0400, 0555) are created 0600 so strict NFS servers can't refuse the
+// data writes, then chmod'd to the target mode after close. The process runs
+// with umask 0 (set in main) so create modes apply exactly.
+func createModeFor(mode os.FileMode) (createMode os.FileMode, needChmod bool) {
+	if mode&0200 != 0 {
+		return mode, false
+	}
+	return 0600, true
+}
+
+// timesConfigured reports whether the config asks for historical timestamps
+// (a range, or a fixed min==max age). When false, freshly created objects
+// already carry "now", so the extra SETATTR can be skipped entirely.
+func timesConfigured() bool {
+	return metaTimeRange > 0 || cfg.MinFileAge > 0
+}
+
 // getRandomTime generates a random time between MinFileAge and MaxFileAge.
 // Uses the precomputed metaTimeRange to skip subtraction per call.
 func getRandomTime() time.Time {
 	if metaTimeRange == 0 {
+		if cfg.MinFileAge > 0 {
+			// min == max: a fixed timestamp was requested.
+			return time.Unix(cfg.MinFileAge, 0)
+		}
 		return time.Now()
 	}
 	return time.Unix(rand.Int64N(metaTimeRange)+cfg.MinFileAge, 0)
 }
 
-// setMetadata sets random ownership, permissions, and historical atime/mtime.
-// Uses precomputed fast-path flags to skip syscalls that would fail or are
-// no-ops (e.g. chown when not running as root). Best-effort: individual
-// syscall errors are intentionally ignored.
-func setMetadata(path string, isDir bool) {
-	// 1. Set Owner/Group — skip entirely when not root since it would just
-	// silently fail. Avoid getRandomID when there's only one uid/gid.
-	if !metaSkipChown {
-		uid := cfg.UIDs[0]
-		if !metaSingleUID {
-			uid = getRandomID(cfg.UIDs)
-		}
-		gid := cfg.GIDs[0]
-		if !metaSingleGID {
-			gid = getRandomID(cfg.GIDs)
-		}
-		os.Chown(path, uid, gid)
+// applyOwnership sets a random uid/gid. Skipped entirely when not root since
+// chown would just silently fail. Best-effort: errors are ignored.
+func applyOwnership(path string) {
+	if metaSkipChown {
+		return
 	}
+	uid := cfg.UIDs[0]
+	if !metaSingleUID {
+		uid = getRandomID(cfg.UIDs)
+	}
+	gid := cfg.GIDs[0]
+	if !metaSingleGID {
+		gid = getRandomID(cfg.GIDs)
+	}
+	os.Chown(path, uid, gid)
+}
 
-	// 2. Set Permissions
+// applyTimes sets historical atime/mtime (independent random values).
+// Must run after the last write/close/chmod so the times stick. Skipped
+// when no time range is configured — creation already stamped "now" and
+// the SETATTR would be a wasted round-trip. Best-effort: errors are ignored.
+func applyTimes(path string) {
+	if !timesConfigured() {
+		return
+	}
+	atime := getRandomTime()
+	mtime := getRandomTime()
+	os.Chtimes(path, atime, mtime)
+}
+
+// setMetadata sets random ownership, permissions, and historical atime/mtime
+// on an existing path. Used by update mode; the populate paths instead bake
+// the mode into create/mkdir (one fewer SETATTR per object on NFS) and call
+// applyOwnership/applyTimes directly.
+func setMetadata(path string, isDir bool) {
+	applyOwnership(path)
+
 	var mode os.FileMode
 	if isDir {
 		mode = getRandomDirPerms()
@@ -208,10 +282,7 @@ func setMetadata(path string, isDir bool) {
 	}
 	os.Chmod(path, mode)
 
-	// 3. Set Historical Access/Modification Times (independent atime and mtime)
-	atime := getRandomTime()
-	mtime := getRandomTime()
-	os.Chtimes(path, atime, mtime)
+	applyTimes(path)
 }
 
 // FastRandom provides fast random byte generation using a pre-filled buffer
@@ -226,9 +297,13 @@ func NewFastRandom(size int) *FastRandom {
 		buffer: make([]byte, size),
 		pos:    0,
 	}
-	// Fill buffer with random non-zero bytes
-	for i := range fr.buffer {
-		fr.buffer[i] = byte(rand.IntN(255) + 1)
+	// Fill 8 bytes per rand call; ~8x faster startup than per-byte fills.
+	i := 0
+	for ; i+8 <= len(fr.buffer); i += 8 {
+		binary.LittleEndian.PutUint64(fr.buffer[i:], rand.Uint64())
+	}
+	for ; i < len(fr.buffer); i++ {
+		fr.buffer[i] = byte(rand.IntN(256))
 	}
 	return fr
 }
@@ -251,18 +326,13 @@ func (fr *FastRandom) Fill(dst []byte) {
 }
 
 // writeRandomDataFast writes random bytes using a caller-supplied reusable
-// chunk buffer. Files that fit in the chunk get a single fill+write; larger
-// files are written in chunk-sized pieces.
-func writeRandomDataFast(filePath string, size int, fr *FastRandom, chunk []byte) error {
-	f, err := os.Create(filePath)
+// chunk buffer. The file is created with the given mode so no follow-up
+// chmod (an extra SETATTR on NFS) is needed. The Close error is returned:
+// NFS clients flush buffered writes at close, so that's where write errors
+// actually surface.
+func writeRandomDataFast(filePath string, size int, mode os.FileMode, fr *FastRandom, chunk []byte) error {
+	f, err := os.OpenFile(filePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
 	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	if size <= len(chunk) {
-		fr.Fill(chunk[:size])
-		_, err := f.Write(chunk[:size])
 		return err
 	}
 
@@ -274,11 +344,12 @@ func writeRandomDataFast(filePath string, size int, fr *FastRandom, chunk []byte
 		}
 		fr.Fill(chunk[:writeSize])
 		if _, err := f.Write(chunk[:writeSize]); err != nil {
+			f.Close()
 			return err
 		}
 		remaining -= writeSize
 	}
-	return nil
+	return f.Close()
 }
 
 // getExtensionForCategory returns a random file extension for the given category
@@ -302,11 +373,56 @@ func getCategoryForPath(path string) string {
 	return "home"
 }
 
-// FileJob represents a file to be created
+// FileJob is a batch of files to create inside one directory. Batching by
+// directory keeps each directory owned by (at most) one worker at a time:
+// Linux serializes creates within a directory on the parent's lock
+// (i_rwsem) — held across the whole OPEN round-trip on NFS — so concurrent
+// creates only parallelize when they target distinct directories.
 type FileJob struct {
-	Path     string
+	Dir      string
 	Category string
-	FileNum  int
+	Start    int // first file number within the directory
+	Count    int
+}
+
+// fileJobChunk caps files per job so a few huge directories still fan out
+// across workers (accepting same-dir contention, unavoidable for that shape).
+const fileJobChunk = 2048
+
+// computeFileCounts distributes target files across nDirs directories:
+// fair share ±2 jitter, then reconciled so the total is exactly target and
+// nothing is silently dropped or overshot.
+func computeFileCounts(nDirs, target int) []int {
+	counts := make([]int, nDirs)
+	if nDirs == 0 || target <= 0 {
+		return counts
+	}
+	base := target / nDirs
+	extra := target % nDirs
+	total := 0
+	for i := range counts {
+		n := base + rand.IntN(5) - 2
+		if i < extra {
+			n++
+		}
+		if n < 0 {
+			n = 0
+		}
+		counts[i] = n
+		total += n
+	}
+	for total > target {
+		i := rand.IntN(nDirs)
+		if counts[i] > 0 {
+			counts[i]--
+			total--
+		}
+	}
+	for total < target {
+		counts[rand.IntN(nDirs)]++
+		total++
+	}
+	return counts
 }
 
 // estimateDirCount returns (avgEstimate, maxPossible) directory counts the
@@ -379,26 +495,33 @@ func populateFilesystem() error {
 			cfg.TargetDirs, maxEst)
 	}
 
-	// Create top-level directories
+	// Create top-level directories. Only successfully created dirs join
+	// allDirs — a failed top-level dir must not become a phase-1 parent or
+	// a phase-2 file target.
+	allDirs := make([]string, 0, cfg.TargetDirs)
 	for _, dir := range topLevelDirs {
 		path := filepath.Join(cfg.BaseDir, dir)
-		if err := os.MkdirAll(path, 0755); err != nil {
+		if err := os.MkdirAll(path, getRandomDirPerms()); err != nil {
 			fmt.Printf("Warning: Could not create %s: %v\n", path, err)
+			continue
 		}
-		setMetadata(path, true)
+		applyOwnership(path)
+		allDirs = append(allDirs, path)
+	}
+	if len(allDirs) == 0 {
+		return fmt.Errorf("could not create any top-level directory under %s", cfg.BaseDir)
 	}
 
 	// Phase 1: Create all directories in parallel, level-by-level (BFS).
 	// At each depth, parents are processed concurrently by cfg.Workers
-	// goroutines, each calling os.Mkdir + setMetadata.
+	// goroutines. Directory modes are baked into mkdir and timestamps are
+	// deferred to phase 3 (creating children would clobber them anyway), so
+	// each directory costs a single MKDIR round-trip (+CHOWN when root).
 	fmt.Println("Phase 1: Creating directory structure (parallel)...")
-	allDirs := make([]string, 0, cfg.TargetDirs)
-	for _, dir := range topLevelDirs {
-		allDirs = append(allDirs, filepath.Join(cfg.BaseDir, dir))
-	}
+	phase1Start := time.Now()
 
 	var totalDirs atomic.Int64
-	totalDirs.Store(int64(len(topLevelDirs)))
+	totalDirs.Store(int64(len(allDirs)))
 	target := int64(cfg.TargetDirs)
 
 	currentLevel := make([]string, len(allDirs))
@@ -432,10 +555,10 @@ func populateFilesystem() error {
 						}
 						dirName := fmt.Sprintf("d_%03d_%d", rand.IntN(999), counter)
 						newDirPath := filepath.Join(parentDir, dirName)
-						if err := os.Mkdir(newDirPath, 0755); err != nil {
+						if err := os.Mkdir(newDirPath, getRandomDirPerms()); err != nil {
 							continue
 						}
-						setMetadata(newDirPath, true)
+						applyOwnership(newDirPath)
 						local = append(local, newDirPath)
 					}
 				}
@@ -450,26 +573,32 @@ func populateFilesystem() error {
 
 		allDirs = append(allDirs, nextLevel...)
 		fmt.Printf("  [%s] Depth %d: %d directories total\n",
-			nowStamp(), parentDepth+1, totalDirs.Load())
+			nowStamp(), parentDepth+1, len(allDirs))
 		currentLevel = nextLevel
 	}
 
-	currentDirs := int(totalDirs.Load())
-	if currentDirs > cfg.TargetDirs {
-		currentDirs = cfg.TargetDirs
-	}
+	// len(allDirs) counts directories actually created, unlike the
+	// reservation counter which also ticks for failed mkdirs.
+	currentDirs := len(allDirs)
+	phase1Elapsed := time.Since(phase1Start)
+	dirRate := float64(currentDirs) / phase1Elapsed.Seconds()
 	if currentDirs < cfg.TargetDirs {
-		fmt.Printf("Phase 1 complete: %d directories created (below target %d - tree shape capped growth at depth %d)\n",
-			currentDirs, cfg.TargetDirs, cfg.MaxDepth)
+		fmt.Printf("Phase 1 complete: %d directories in %s (%.0f dirs/sec; below target %d - tree shape capped growth at depth %d)\n",
+			currentDirs, phase1Elapsed.Round(time.Second), dirRate, cfg.TargetDirs, cfg.MaxDepth)
 	} else {
-		fmt.Printf("Phase 1 complete: %d directories created\n", currentDirs)
+		fmt.Printf("Phase 1 complete: %d directories in %s (%.0f dirs/sec)\n",
+			currentDirs, phase1Elapsed.Round(time.Second), dirRate)
 	}
 
 	// Phase 2: Create files in parallel
 	fmt.Println("Phase 2: Creating files with parallel workers...")
+	phase2Start := time.Now()
 
-	// Channel for file jobs
-	jobs := make(chan FileJob, cfg.Workers*100)
+	// Per-directory file counts that sum exactly to target_files.
+	fileCounts := computeFileCounts(len(allDirs), cfg.TargetFiles)
+
+	// Channel for per-directory file job batches
+	jobs := make(chan FileJob, cfg.Workers*4)
 	// Channel for completed file path batches (for logging).
 	// Batching cuts per-file channel send overhead by ~256x.
 	results := make(chan []string, cfg.Workers*4)
@@ -477,10 +606,13 @@ func populateFilesystem() error {
 	done := make(chan struct{})
 
 	var fileCount atomic.Int64
+	var failCount atomic.Int64
+	var byteCount atomic.Int64
 	var wg sync.WaitGroup
 
 	// Start log writer goroutine
 	go func() {
+		defer close(done)
 		logFile, err := os.OpenFile(cfg.LogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 		if err != nil {
 			fmt.Printf("Warning: Could not open log file: %v\n", err)
@@ -498,8 +630,9 @@ func populateFilesystem() error {
 				writer.WriteByte('\n')
 			}
 		}
-		writer.Flush()
-		close(done)
+		if err := writer.Flush(); err != nil {
+			fmt.Printf("Warning: log file write failed: %v\n", err)
+		}
 	}()
 
 	// Start worker goroutines
@@ -511,37 +644,53 @@ func populateFilesystem() error {
 			// Each worker gets its own fast random generator (1MB buffer)
 			// and a reusable write chunk to avoid per-file allocations.
 			fr := NewFastRandom(1024 * 1024)
-			chunk := make([]byte, 64*1024)
+			chunk := make([]byte, 256*1024)
 			batch := make([]string, 0, logBatchSize)
 
 			for job := range jobs {
-				ext := getExtensionForCategory(job.Category)
-				fileName := fmt.Sprintf("f_%06d%s", job.FileNum, ext)
-				filePath := filepath.Join(job.Path, fileName)
+				exts := cfg.FileExtensions[job.Category]
+				for j := 0; j < job.Count; j++ {
+					ext := ".dat"
+					if len(exts) > 0 {
+						ext = exts[rand.IntN(len(exts))]
+					}
+					fileName := fmt.Sprintf("f_%06d%s", job.Start+j, ext)
+					filePath := filepath.Join(job.Dir, fileName)
 
-				// Determine file size
-				fileSize := rand.IntN(cfg.FileSize.MaxNormal-cfg.FileSize.MinNormal+1) + cfg.FileSize.MinNormal
-				if rand.IntN(100) < cfg.FileSize.LargeFileChance {
-					fileSize = rand.IntN(cfg.FileSize.MaxLarge-cfg.FileSize.MinLarge+1) + cfg.FileSize.MinLarge
-				}
+					// Determine file size
+					var fileSize int
+					if cfg.FileSize.LargeFileChance > 0 && rand.IntN(100) < cfg.FileSize.LargeFileChance {
+						fileSize = rand.IntN(cfg.FileSize.MaxLarge-cfg.FileSize.MinLarge+1) + cfg.FileSize.MinLarge
+					} else {
+						fileSize = rand.IntN(cfg.FileSize.MaxNormal-cfg.FileSize.MinNormal+1) + cfg.FileSize.MinNormal
+					}
 
-				if err := writeRandomDataFast(filePath, fileSize, fr, chunk); err != nil {
-					continue
-				}
-				setMetadata(filePath, false)
+					mode := getRandomPerms()
+					createMode, needChmod := createModeFor(mode)
+					if err := writeRandomDataFast(filePath, fileSize, createMode, fr, chunk); err != nil {
+						failCount.Add(1)
+						continue
+					}
+					applyOwnership(filePath)
+					if needChmod {
+						os.Chmod(filePath, mode)
+					}
+					applyTimes(filePath)
+					byteCount.Add(int64(fileSize))
 
-				batch = append(batch, filePath)
-				if len(batch) >= logBatchSize {
-					results <- batch
-					batch = make([]string, 0, logBatchSize)
-				}
+					batch = append(batch, filePath)
+					if len(batch) >= logBatchSize {
+						results <- batch
+						batch = make([]string, 0, logBatchSize)
+					}
 
-				count := fileCount.Add(1)
-				if count%100000 == 0 {
-					elapsed := time.Since(startTime)
-					rate := float64(count) / elapsed.Seconds()
-					fmt.Printf("  [%s] Progress: %d files (%.0f files/sec)\n",
-						nowStamp(), count, rate)
+					count := fileCount.Add(1)
+					if count%100000 == 0 {
+						elapsed := time.Since(phase2Start)
+						rate := float64(count) / elapsed.Seconds()
+						fmt.Printf("  [%s] Progress: %d files (%.0f files/sec)\n",
+							nowStamp(), count, rate)
+					}
 				}
 			}
 			if len(batch) > 0 {
@@ -550,38 +699,21 @@ func populateFilesystem() error {
 		}()
 	}
 
-	// Generate file jobs - distribute files across directories
+	// Generate per-directory jobs, chunked so huge directories still spread
+	// across workers.
 	go func() {
-		fileNum := 0
-		filesPerDir := cfg.TargetFiles / len(allDirs)
-		if filesPerDir < 1 {
-			filesPerDir = 1
-		}
-		extraFiles := cfg.TargetFiles % len(allDirs)
-
 		for i, dir := range allDirs {
-			if fileNum >= cfg.TargetFiles {
-				break
+			n := fileCounts[i]
+			if n == 0 {
+				continue
 			}
-
 			category := getCategoryForPath(dir)
-			numFiles := filesPerDir
-			if i < extraFiles {
-				numFiles++
-			}
-			// Add some randomness
-			numFiles = numFiles + rand.IntN(5) - 2
-			if numFiles < 1 {
-				numFiles = 1
-			}
-
-			for j := 0; j < numFiles && fileNum < cfg.TargetFiles; j++ {
-				jobs <- FileJob{
-					Path:     dir,
-					Category: category,
-					FileNum:  fileNum,
+			for start := 0; start < n; start += fileJobChunk {
+				c := n - start
+				if c > fileJobChunk {
+					c = fileJobChunk
 				}
-				fileNum++
+				jobs <- FileJob{Dir: dir, Category: category, Start: start, Count: c}
 			}
 		}
 		close(jobs)
@@ -593,21 +725,55 @@ func populateFilesystem() error {
 	<-done
 
 	finalCount := fileCount.Load()
-	finalElapsed := time.Since(startTime)
-	rate := float64(finalCount) / finalElapsed.Seconds()
+	phase2Elapsed := time.Since(phase2Start)
+	fileRate := float64(finalCount) / phase2Elapsed.Seconds()
+	fmt.Printf("Phase 2 complete: %d files in %s (%.0f files/sec)\n",
+		finalCount, phase2Elapsed.Round(time.Second), fileRate)
 
+	// Phase 3: restamp directory times. Creating children bumped every
+	// directory's mtime to "now"; historical times only stick once the
+	// tree is quiescent.
+	if timesConfigured() {
+		fmt.Println("Phase 3: Restamping directory times...")
+		phase3Start := time.Now()
+		dirCh := make(chan string, 1024)
+		var dwg sync.WaitGroup
+		for w := 0; w < cfg.Workers; w++ {
+			dwg.Add(1)
+			go func() {
+				defer dwg.Done()
+				for d := range dirCh {
+					applyTimes(d)
+				}
+			}()
+		}
+		for _, d := range allDirs {
+			dirCh <- d
+		}
+		close(dirCh)
+		dwg.Wait()
+		fmt.Printf("Phase 3 complete: %d directories restamped in %s\n",
+			len(allDirs), time.Since(phase3Start).Round(time.Second))
+	}
+
+	totalElapsed := time.Since(startTime)
 	fmt.Printf("\n--- Population Complete ---\n")
-	fmt.Printf("Total Files: %d\n", finalCount)
+	fmt.Printf("Total Files: %d (target %d)\n", finalCount, cfg.TargetFiles)
+	if failed := failCount.Load(); failed > 0 {
+		fmt.Printf("Failed Creates: %d (not counted above, not logged)\n", failed)
+	}
 	fmt.Printf("Total Directories: %d\n", currentDirs)
-	fmt.Printf("Time Taken: %s\n", finalElapsed.Round(time.Second))
-	fmt.Printf("Average Rate: %.0f files/sec\n", rate)
+	fmt.Printf("Data Written: %.2f GB\n", float64(byteCount.Load())/(1024*1024*1024))
+	fmt.Printf("Time Taken: %s (dirs %s, files %s)\n",
+		totalElapsed.Round(time.Second), phase1Elapsed.Round(time.Second), phase2Elapsed.Round(time.Second))
+	fmt.Printf("Average Rate: %.0f files/sec (phase 2)\n", fileRate)
 
 	return nil
 }
 
-// TortureJob represents a range of files to create in a directory
+// TortureJob represents a range of files to create in one flat directory
 type TortureJob struct {
-	DirPath   string
+	DirIdx    int
 	StartFile int64
 	EndFile   int64
 }
@@ -640,102 +806,131 @@ func populateTorture() error {
 		return fmt.Errorf("failed to create base directory: %w", err)
 	}
 
-	totalStartTime := time.Now()
-	var totalFiles int64
-
-	// Process each flat directory
-	for dirIdx, dirName := range cfg.Torture.FlatDirs {
-		dirPath := filepath.Join(cfg.BaseDir, dirName)
-		fmt.Printf("\n--- Directory %d/%d: %s ---\n", dirIdx+1, len(cfg.Torture.FlatDirs), dirPath)
-
-		// Create the directory
-		if err := os.MkdirAll(dirPath, 0755); err != nil {
-			return fmt.Errorf("failed to create directory %s: %w", dirPath, err)
+	// Create all flat directories up front; one shared worker pool then
+	// round-robins across them. Filling directories one at a time (the old
+	// behavior) serialized every create behind a single directory's kernel
+	// lock — with N dirs in flight the creates actually run in parallel.
+	dirPaths := make([]string, len(cfg.Torture.FlatDirs))
+	for i, dirName := range cfg.Torture.FlatDirs {
+		dirPaths[i] = filepath.Join(cfg.BaseDir, dirName)
+		if err := os.MkdirAll(dirPaths[i], 0755); err != nil {
+			return fmt.Errorf("failed to create directory %s: %w", dirPaths[i], err)
 		}
+	}
+	if len(dirPaths) == 1 && cfg.Workers > 1 {
+		fmt.Println("NOTE: a single flat dir serializes creates on the client's directory lock;")
+		fmt.Println("      list multiple flat_dirs to get real parallelism out of the workers.")
+	}
 
-		dirStartTime := time.Now()
-		var fileCount atomic.Int64
+	startTime := time.Now()
+	grandTotal := int64(len(dirPaths)) * cfg.Torture.FilesPerDir
+	var totalCount atomic.Int64
+	var failCount atomic.Int64
+	perDir := make([]atomic.Int64, len(dirPaths))
 
-		// Channel for file creation jobs (batched by range)
-		jobs := make(chan TortureJob, cfg.Workers*2)
-		var wg sync.WaitGroup
+	jobs := make(chan TortureJob, cfg.Workers*2)
+	var wg sync.WaitGroup
 
-		// Start worker goroutines
-		for w := 0; w < cfg.Workers; w++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				// Each worker gets its own random buffer
-				fr := NewFastRandom(64 * 1024)
-				content := make([]byte, cfg.Torture.FileSizeBytes)
-				fr.Fill(content)
+	// Start worker goroutines
+	for w := 0; w < cfg.Workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Per-worker rolling random pool, refilled per file so content
+			// differs file to file — identical content would let
+			// dedup-capable storage cheat the test.
+			fr := NewFastRandom(1024 * 1024)
+			content := make([]byte, cfg.Torture.FileSizeBytes)
 
-				for job := range jobs {
-					for fileNum := job.StartFile; fileNum < job.EndFile; fileNum++ {
-						// Simple numeric filename: f_000000000001.dat
-						fileName := fmt.Sprintf("f_%012d.dat", fileNum)
-						filePath := filepath.Join(job.DirPath, fileName)
+			for job := range jobs {
+				dirPath := dirPaths[job.DirIdx]
+				for fileNum := job.StartFile; fileNum < job.EndFile; fileNum++ {
+					// Simple numeric filename: f_000000000001.dat
+					fileName := fmt.Sprintf("f_%012d.dat", fileNum)
+					filePath := filepath.Join(dirPath, fileName)
 
-						// Create file with pre-filled content
-						f, err := os.Create(filePath)
-						if err != nil {
-							continue
-						}
-						f.Write(content)
+					mode := os.FileMode(0644)
+					if !cfg.Torture.SkipMetadata {
+						mode = getRandomPerms()
+					}
+					createMode, needChmod := createModeFor(mode)
+
+					fr.Fill(content)
+					f, err := os.OpenFile(filePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, createMode)
+					if err != nil {
+						failCount.Add(1)
+						continue
+					}
+					if _, err := f.Write(content); err != nil {
 						f.Close()
+						failCount.Add(1)
+						continue
+					}
+					// NFS surfaces buffered write errors at close; a file
+					// only counts once close succeeds.
+					if err := f.Close(); err != nil {
+						failCount.Add(1)
+						continue
+					}
 
-						if !cfg.Torture.SkipMetadata {
-							setMetadata(filePath, false)
+					if !cfg.Torture.SkipMetadata {
+						applyOwnership(filePath)
+						if needChmod {
+							os.Chmod(filePath, mode)
 						}
+						applyTimes(filePath)
+					}
 
-						count := fileCount.Add(1)
-						if count%reportInterval == 0 {
-							elapsed := time.Since(dirStartTime)
-							rate := float64(count) / elapsed.Seconds()
-							pct := float64(count) / float64(cfg.Torture.FilesPerDir) * 100
-							fmt.Printf("  [%s] Progress: %d files (%.1f%%) - %.0f files/sec\n",
-								nowStamp(), count, pct, rate)
-						}
+					perDir[job.DirIdx].Add(1)
+					count := totalCount.Add(1)
+					if count%reportInterval == 0 {
+						elapsed := time.Since(startTime)
+						rate := float64(count) / elapsed.Seconds()
+						pct := float64(count) / float64(grandTotal) * 100
+						fmt.Printf("  [%s] Progress: %d/%d files (%.1f%%) - %.0f files/sec\n",
+							nowStamp(), count, grandTotal, pct, rate)
 					}
 				}
-			}()
-		}
+			}
+		}()
+	}
 
-		// Generate jobs - batch files into chunks
-		go func() {
-			batchSize := int64(10000) // 10K files per job
-			for start := int64(0); start < cfg.Torture.FilesPerDir; start += batchSize {
-				end := start + batchSize
-				if end > cfg.Torture.FilesPerDir {
-					end = cfg.Torture.FilesPerDir
-				}
+	// Emit jobs round-robin across directories so every directory is in
+	// flight at once.
+	go func() {
+		const batchSize = int64(10000) // 10K files per job
+		for start := int64(0); start < cfg.Torture.FilesPerDir; start += batchSize {
+			end := start + batchSize
+			if end > cfg.Torture.FilesPerDir {
+				end = cfg.Torture.FilesPerDir
+			}
+			for di := range dirPaths {
 				jobs <- TortureJob{
-					DirPath:   dirPath,
+					DirIdx:    di,
 					StartFile: start,
 					EndFile:   end,
 				}
 			}
-			close(jobs)
-		}()
+		}
+		close(jobs)
+	}()
 
-		// Wait for all workers
-		wg.Wait()
+	// Wait for all workers
+	wg.Wait()
 
-		dirElapsed := time.Since(dirStartTime)
-		dirCount := fileCount.Load()
-		dirRate := float64(dirCount) / dirElapsed.Seconds()
-		totalFiles += dirCount
-
-		fmt.Printf("  Directory complete: %d files in %s (%.0f files/sec)\n",
-			dirCount, dirElapsed.Round(time.Second), dirRate)
-	}
-
-	totalElapsed := time.Since(totalStartTime)
+	totalElapsed := time.Since(startTime)
+	totalFiles := totalCount.Load()
 	totalRate := float64(totalFiles) / totalElapsed.Seconds()
 
 	fmt.Printf("\n=== TORTURE MODE COMPLETE ===\n")
+	for i, p := range dirPaths {
+		fmt.Printf("  %s: %d files\n", p, perDir[i].Load())
+	}
 	fmt.Printf("Total Files: %d\n", totalFiles)
-	fmt.Printf("Total Directories: %d\n", len(cfg.Torture.FlatDirs))
+	if failed := failCount.Load(); failed > 0 {
+		fmt.Printf("Failed Creates: %d\n", failed)
+	}
+	fmt.Printf("Total Directories: %d\n", len(dirPaths))
 	fmt.Printf("Total Time: %s\n", totalElapsed.Round(time.Second))
 	fmt.Printf("Overall Rate: %.0f files/sec\n", totalRate)
 
@@ -789,6 +984,7 @@ func populateDeep() error {
 
 	currentPath := cfg.BaseDir
 	totalFiles := 0
+	levelDirs := make([]string, 0, cfg.Deep.Depth)
 
 	for level := 1; level <= cfg.Deep.Depth; level++ {
 		// Create directory for this level (short name to avoid PATH_MAX)
@@ -798,6 +994,7 @@ func populateDeep() error {
 		if err := os.Mkdir(currentPath, 0755); err != nil {
 			return fmt.Errorf("failed to create directory at level %d: %w", level, err)
 		}
+		levelDirs = append(levelDirs, currentPath)
 
 		if !cfg.Deep.SkipMetadata {
 			setMetadata(currentPath, true)
@@ -808,12 +1005,17 @@ func populateDeep() error {
 			fileName := fmt.Sprintf("f%03d.dat", f)
 			filePath := filepath.Join(currentPath, fileName)
 
-			file, err := os.Create(filePath)
+			file, err := os.OpenFile(filePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 			if err != nil {
 				return fmt.Errorf("failed to create file at level %d: %w", level, err)
 			}
-			file.Write(content)
-			file.Close()
+			if _, err := file.Write(content); err != nil {
+				file.Close()
+				return fmt.Errorf("failed to write file at level %d: %w", level, err)
+			}
+			if err := file.Close(); err != nil {
+				return fmt.Errorf("failed to close file at level %d: %w", level, err)
+			}
 
 			if !cfg.Deep.SkipMetadata {
 				setMetadata(filePath, false)
@@ -827,6 +1029,14 @@ func populateDeep() error {
 			elapsed := time.Since(startTime)
 			fmt.Printf("  Level %d/%d - %d files (%.1f sec)\n",
 				level, cfg.Deep.Depth, totalFiles, elapsed.Seconds())
+		}
+	}
+
+	// Creating children bumped each level's mtime; restamp so historical
+	// dir times stick.
+	if !cfg.Deep.SkipMetadata && timesConfigured() {
+		for _, d := range levelDirs {
+			applyTimes(d)
 		}
 	}
 
@@ -1014,7 +1224,7 @@ func createNewFile(idx *FileIndex) error {
 
 	fr := NewFastRandom(64 * 1024)
 	chunk := make([]byte, 64*1024)
-	if err := writeRandomDataFast(filePath, fileSize, fr, chunk); err != nil {
+	if err := writeRandomDataFast(filePath, fileSize, 0644, fr, chunk); err != nil {
 		return fmt.Errorf("failed to write new file %s: %w", filePath, err)
 	}
 
@@ -1159,6 +1369,10 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Printf("Configuration loaded successfully\n\n")
+
+	// Permission modes are baked into open/mkdir calls (saves a SETATTR per
+	// object on NFS); clear the umask once so those modes apply exactly.
+	syscall.Umask(0)
 
 	switch mode {
 	case "populate":
