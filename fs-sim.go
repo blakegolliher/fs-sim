@@ -1340,28 +1340,53 @@ func runDynamicUpdate() error {
 	}
 }
 
-func main() {
-	var configPath string
-	var mode string
-	var showVersion bool
+func parseArgs(args []string) (configPath, mode string, showVersion bool, err error) {
+	configPath = "config.yaml"
 
-	flag.StringVar(&configPath, "config", "config.yaml", "Path to configuration file")
-	flag.StringVar(&mode, "mode", "", "Mode: populate or update")
-	flag.BoolVar(&showVersion, "version", false, "Print version and exit")
-	flag.Parse()
+	var flagArgs []string
+	for _, arg := range args {
+		switch strings.ToLower(arg) {
+		case "populate", "torture", "deep", "update":
+			if mode != "" {
+				return "", "", false, fmt.Errorf("multiple modes specified: %q and %q", mode, arg)
+			}
+			mode = strings.ToLower(arg)
+		default:
+			flagArgs = append(flagArgs, arg)
+		}
+	}
+
+	fs := flag.NewFlagSet("fs-sim", flag.ContinueOnError)
+	fs.StringVar(&configPath, "config", configPath, "Path to configuration file")
+	fs.StringVar(&mode, "mode", mode, "Mode: populate, torture, deep, or update")
+	fs.BoolVar(&showVersion, "version", false, "Print version and exit")
+	if err := fs.Parse(flagArgs); err != nil {
+		return "", "", false, err
+	}
+	if fs.NArg() != 0 {
+		return "", "", false, fmt.Errorf("unexpected arguments: %s", strings.Join(fs.Args(), " "))
+	}
+
+	mode = strings.ToLower(mode)
+	return configPath, mode, showVersion, nil
+}
+
+func main() {
+	configPath, mode, showVersion, err := parseArgs(os.Args[1:])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "FATAL: %v\n", err)
+		os.Exit(2)
+	}
 
 	if showVersion {
 		fmt.Printf("fs-sim %s\n", version)
 		return
 	}
 
-	if mode == "" && flag.NArg() > 0 {
-		mode = strings.ToLower(flag.Arg(0))
-	}
-
 	if mode == "" {
 		fmt.Printf("fs-sim %s\n\n", version)
 		fmt.Println("Usage: fs-sim [--config config.yaml] <mode>")
+		fmt.Println("       fs-sim <mode> [--config config.yaml]")
 		fmt.Println("       fs-sim --mode=<mode> [--config=config.yaml]")
 		fmt.Println("")
 		fmt.Println("Modes:")
