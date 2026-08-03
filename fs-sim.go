@@ -1136,6 +1136,10 @@ func main() {
 
 	if mode == "" && flag.NArg() > 0 {
 		mode = strings.ToLower(flag.Arg(0))
+		// The stdlib flag package stops parsing at the first positional
+		// argument, so flags placed after the subcommand (fs-sim populate
+		// --config=...) would otherwise be silently ignored.
+		flag.CommandLine.Parse(flag.Args()[1:])
 	}
 
 	if mode == "" {
