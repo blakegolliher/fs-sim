@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -356,8 +357,87 @@ func estimateDirCount(topLevel, maxSubdirs, maxDepth int, target int64) (int64, 
 	return avgTotal, maxTotal
 }
 
-// populateFilesystem creates the initial directory structure and files
-func populateFilesystem() error {
+// resumeScan walks an existing population tree with parallel workers,
+// returning every directory, how many files each already holds, and the next
+// safe fr_ file index per directory. Resumed runs name files fr_<n> (parsed
+// here as a max, so gaps from a crashed resume can't cause collisions),
+// keeping them disjoint from the f_<n> series of the original run.
+func resumeScan() (dirs []string, existing []int64, nextIdx []int64, totalExisting int64, err error) {
+	var current []string
+	for _, d := range topLevelDirNames() {
+		p := filepath.Join(cfg.BaseDir, d)
+		if fi, statErr := os.Stat(p); statErr == nil && fi.IsDir() {
+			current = append(current, p)
+		}
+	}
+	if len(current) == 0 {
+		return nil, nil, nil, 0, fmt.Errorf("no existing tree under %s to resume (expected top-level dirs %v)", cfg.BaseDir, topLevelDirNames())
+	}
+
+	var mu sync.Mutex
+	var scanned int64
+	for len(current) > 0 {
+		parents := make(chan string, len(current))
+		for _, p := range current {
+			parents <- p
+		}
+		close(parents)
+
+		var next []string
+		var wg sync.WaitGroup
+		for w := 0; w < cfg.Workers; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for p := range parents {
+					entries, readErr := os.ReadDir(p)
+					if readErr != nil {
+						continue
+					}
+					var files int64
+					maxIdx := int64(-1)
+					var children []string
+					for _, e := range entries {
+						if e.IsDir() {
+							children = append(children, filepath.Join(p, e.Name()))
+							continue
+						}
+						files++
+						if name := e.Name(); strings.HasPrefix(name, "fr_") {
+							numStr := name[3:]
+							if dot := strings.IndexByte(numStr, '.'); dot >= 0 {
+								numStr = numStr[:dot]
+							}
+							if v, convErr := strconv.ParseInt(numStr, 10, 64); convErr == nil && v > maxIdx {
+								maxIdx = v
+							}
+						}
+					}
+					mu.Lock()
+					dirs = append(dirs, p)
+					existing = append(existing, files)
+					nextIdx = append(nextIdx, maxIdx+1)
+					totalExisting += files
+					next = append(next, children...)
+					scanned++
+					n := scanned
+					mu.Unlock()
+					if n%200000 == 0 {
+						fmt.Printf("  [%s] Scanned %d directories, %d files so far\n", nowStamp(), n, totalExisting)
+					}
+				}
+			}()
+		}
+		wg.Wait()
+		current = next
+	}
+	return dirs, existing, nextIdx, totalExisting, nil
+}
+
+// populateFilesystem creates the initial directory structure and files.
+// With resume=true it skips directory creation, rescans the existing tree,
+// and creates only the files still missing to reach TargetFiles.
+func populateFilesystem(resume bool) error {
 	fmt.Println("--- Starting initial filesystem population ---")
 	fmt.Printf("Targets: %d files, up to %d directories\n", cfg.TargetFiles, cfg.TargetDirs)
 	fmt.Printf("Base directory: %s\n", cfg.BaseDir)
@@ -370,122 +450,200 @@ func populateFilesystem() error {
 	}
 	startTime := time.Now()
 
-	// Ensure base directory exists
-	if err := os.MkdirAll(cfg.BaseDir, 0755); err != nil {
-		return fmt.Errorf("failed to create base directory: %w", err)
-	}
+	var allDirs []string
+	var existingCounts, resumeNextIdx []int64
+	var totalExisting int64
+	var currentDirs int
 
-	// Get top-level directory names from file extensions config
-	topLevelDirs := topLevelDirNames()
-
-	// Tell the user up front what tree shape can actually produce, so a
-	// target_dirs that exceeds the achievable maximum is obvious before
-	// Phase 1 begins.
-	avgEst, maxEst := estimateDirCount(len(topLevelDirs), cfg.MaxSubdirsPerDir, cfg.MaxDepth, int64(cfg.TargetDirs))
-	fmt.Printf("Tree shape: max_depth=%d, max_subdirs_per_dir=%d, top-level=%d -> ~%d dirs avg, %d dirs max\n",
-		cfg.MaxDepth, cfg.MaxSubdirsPerDir, len(topLevelDirs), avgEst, maxEst)
-	if int64(cfg.TargetDirs) > maxEst {
-		fmt.Printf("NOTE: target_dirs=%d exceeds the achievable max (%d). Increase max_depth or max_subdirs_per_dir to grow more dirs.\n",
-			cfg.TargetDirs, maxEst)
-	}
-
-	// Create top-level directories
-	for _, dir := range topLevelDirs {
-		path := filepath.Join(cfg.BaseDir, dir)
-		if err := os.MkdirAll(path, 0755); err != nil {
-			fmt.Printf("Warning: Could not create %s: %v\n", path, err)
+	if resume {
+		fmt.Println("Phase 1 (resume): scanning existing tree in parallel...")
+		var err error
+		allDirs, existingCounts, resumeNextIdx, totalExisting, err = resumeScan()
+		if err != nil {
+			return err
 		}
-		if !cfg.SkipMetadata {
-			setMetadata(path, true)
+		currentDirs = len(allDirs)
+		fmt.Printf("Phase 1 complete: found %d directories holding %d existing files (target %d)\n",
+			currentDirs, totalExisting, cfg.TargetFiles)
+	} else {
+		// Ensure base directory exists
+		if err := os.MkdirAll(cfg.BaseDir, 0755); err != nil {
+			return fmt.Errorf("failed to create base directory: %w", err)
 		}
-	}
 
-	// Phase 1: Create all directories in parallel, level-by-level (BFS).
-	// At each depth, parents are processed concurrently by cfg.Workers
-	// goroutines, each calling os.Mkdir + setMetadata.
-	fmt.Println("Phase 1: Creating directory structure (parallel)...")
-	allDirs := make([]string, 0, cfg.TargetDirs)
-	for _, dir := range topLevelDirs {
-		allDirs = append(allDirs, filepath.Join(cfg.BaseDir, dir))
-	}
+		// Get top-level directory names from file extensions config
+		topLevelDirs := topLevelDirNames()
 
-	var totalDirs atomic.Int64
-	totalDirs.Store(int64(len(topLevelDirs)))
-	target := int64(cfg.TargetDirs)
-
-	currentLevel := make([]string, len(allDirs))
-	copy(currentLevel, allDirs)
-
-	for parentDepth := 1; parentDepth < cfg.MaxDepth && totalDirs.Load() < target && len(currentLevel) > 0; parentDepth++ {
-		parents := make(chan string, len(currentLevel))
-		for _, p := range currentLevel {
-			parents <- p
+		// Refuse to populate on top of an existing tree: rerunning into one
+		// double-fills directories, and an interrupted run should be
+		// continued with --resume instead.
+		for _, dir := range topLevelDirs {
+			p := filepath.Join(cfg.BaseDir, dir)
+			if entries, readErr := os.ReadDir(p); readErr == nil && len(entries) > 0 {
+				return fmt.Errorf("%s already contains data — use --resume to continue an interrupted run, or remove the tree first", p)
+			}
 		}
-		close(parents)
 
-		var nextLevel []string
-		var nextMu sync.Mutex
-		var dirWg sync.WaitGroup
+		// Tell the user up front what tree shape can actually produce, so a
+		// target_dirs that exceeds the achievable maximum is obvious before
+		// Phase 1 begins.
+		avgEst, maxEst := estimateDirCount(len(topLevelDirs), cfg.MaxSubdirsPerDir, cfg.MaxDepth, int64(cfg.TargetDirs))
+		fmt.Printf("Tree shape: max_depth=%d, max_subdirs_per_dir=%d, top-level=%d -> ~%d dirs avg, %d dirs max\n",
+			cfg.MaxDepth, cfg.MaxSubdirsPerDir, len(topLevelDirs), avgEst, maxEst)
+		if int64(cfg.TargetDirs) > maxEst {
+			fmt.Printf("NOTE: target_dirs=%d exceeds the achievable max (%d). Increase max_depth or max_subdirs_per_dir to grow more dirs.\n",
+				cfg.TargetDirs, maxEst)
+		}
 
-		// With few parents at this level, a run of zero-child rolls can stall
-		// the whole tree (worst case: a single top-level dir rolls 0 and the
-		// entire population lands flat in one directory). Guarantee at least
-		// one child per parent while the level is still narrow.
-		ensureChild := len(currentLevel) <= 2
+		// Create top-level directories
+		for _, dir := range topLevelDirs {
+			path := filepath.Join(cfg.BaseDir, dir)
+			if err := os.MkdirAll(path, 0755); err != nil {
+				fmt.Printf("Warning: Could not create %s: %v\n", path, err)
+			}
+			if !cfg.SkipMetadata {
+				setMetadata(path, true)
+			}
+		}
 
-		for w := 0; w < cfg.Workers; w++ {
-			dirWg.Add(1)
-			go func() {
-				defer dirWg.Done()
-				local := make([]string, 0, 256)
-				for parentDir := range parents {
-					if totalDirs.Load() >= target {
-						continue
-					}
-					numSubDirs := rand.IntN(cfg.MaxSubdirsPerDir + 1)
-					if numSubDirs == 0 && ensureChild {
-						numSubDirs = 1
-					}
-					for i := 0; i < numSubDirs; i++ {
-						counter := totalDirs.Add(1)
-						if counter > target {
-							break
-						}
-						dirName := fmt.Sprintf("d_%03d_%d", rand.IntN(999), counter)
-						newDirPath := filepath.Join(parentDir, dirName)
-						if err := os.Mkdir(newDirPath, 0755); err != nil {
+		// Phase 1: Create all directories in parallel, level-by-level (BFS).
+		// At each depth, parents are processed concurrently by cfg.Workers
+		// goroutines, each calling os.Mkdir + setMetadata.
+		fmt.Println("Phase 1: Creating directory structure (parallel)...")
+		allDirs = make([]string, 0, cfg.TargetDirs)
+		for _, dir := range topLevelDirs {
+			allDirs = append(allDirs, filepath.Join(cfg.BaseDir, dir))
+		}
+
+		var totalDirs atomic.Int64
+		totalDirs.Store(int64(len(topLevelDirs)))
+		target := int64(cfg.TargetDirs)
+
+		currentLevel := make([]string, len(allDirs))
+		copy(currentLevel, allDirs)
+
+		for parentDepth := 1; parentDepth < cfg.MaxDepth && totalDirs.Load() < target && len(currentLevel) > 0; parentDepth++ {
+			parents := make(chan string, len(currentLevel))
+			for _, p := range currentLevel {
+				parents <- p
+			}
+			close(parents)
+
+			var nextLevel []string
+			var nextMu sync.Mutex
+			var dirWg sync.WaitGroup
+
+			// With few parents at this level, a run of zero-child rolls can stall
+			// the whole tree (worst case: a single top-level dir rolls 0 and the
+			// entire population lands flat in one directory). Guarantee at least
+			// one child per parent while the level is still narrow.
+			ensureChild := len(currentLevel) <= 2
+
+			for w := 0; w < cfg.Workers; w++ {
+				dirWg.Add(1)
+				go func() {
+					defer dirWg.Done()
+					local := make([]string, 0, 256)
+					for parentDir := range parents {
+						if totalDirs.Load() >= target {
 							continue
 						}
-						if !cfg.SkipMetadata {
-							setMetadata(newDirPath, true)
+						numSubDirs := rand.IntN(cfg.MaxSubdirsPerDir + 1)
+						if numSubDirs == 0 && ensureChild {
+							numSubDirs = 1
 						}
-						local = append(local, newDirPath)
+						for i := 0; i < numSubDirs; i++ {
+							counter := totalDirs.Add(1)
+							if counter > target {
+								break
+							}
+							dirName := fmt.Sprintf("d_%03d_%d", rand.IntN(999), counter)
+							newDirPath := filepath.Join(parentDir, dirName)
+							if err := os.Mkdir(newDirPath, 0755); err != nil {
+								continue
+							}
+							if !cfg.SkipMetadata {
+								setMetadata(newDirPath, true)
+							}
+							local = append(local, newDirPath)
+						}
 					}
-				}
-				if len(local) > 0 {
-					nextMu.Lock()
-					nextLevel = append(nextLevel, local...)
-					nextMu.Unlock()
-				}
-			}()
+					if len(local) > 0 {
+						nextMu.Lock()
+						nextLevel = append(nextLevel, local...)
+						nextMu.Unlock()
+					}
+				}()
+			}
+			dirWg.Wait()
+
+			allDirs = append(allDirs, nextLevel...)
+			fmt.Printf("  [%s] Depth %d: %d directories total\n",
+				nowStamp(), parentDepth+1, totalDirs.Load())
+			currentLevel = nextLevel
 		}
-		dirWg.Wait()
 
-		allDirs = append(allDirs, nextLevel...)
-		fmt.Printf("  [%s] Depth %d: %d directories total\n",
-			nowStamp(), parentDepth+1, totalDirs.Load())
-		currentLevel = nextLevel
+		currentDirs = int(totalDirs.Load())
+		if currentDirs > cfg.TargetDirs {
+			currentDirs = cfg.TargetDirs
+		}
+		if currentDirs < cfg.TargetDirs {
+			fmt.Printf("Phase 1 complete: %d directories created (below target %d - tree shape capped growth at depth %d)\n",
+				currentDirs, cfg.TargetDirs, cfg.MaxDepth)
+		} else {
+			fmt.Printf("Phase 1 complete: %d directories created\n", currentDirs)
+		}
 	}
 
-	currentDirs := int(totalDirs.Load())
-	if currentDirs > cfg.TargetDirs {
-		currentDirs = cfg.TargetDirs
+	// Plan how many files each directory gets. Fresh runs split TargetFiles
+	// roughly evenly with a little per-dir randomness. Resumed runs fill only
+	// each directory's deficit against an even share, then trim so the tree
+	// lands on TargetFiles exactly even when some dirs are over-filled.
+	remaining := make([]int64, len(allDirs))
+	categories := make([]string, len(allDirs))
+	var plannedTotal int64
+	filesPerDir := int64(cfg.TargetFiles) / int64(len(allDirs))
+	if filesPerDir < 1 {
+		filesPerDir = 1
 	}
-	if currentDirs < cfg.TargetDirs {
-		fmt.Printf("Phase 1 complete: %d directories created (below target %d - tree shape capped growth at depth %d)\n",
-			currentDirs, cfg.TargetDirs, cfg.MaxDepth)
-	} else {
-		fmt.Printf("Phase 1 complete: %d directories created\n", currentDirs)
+	extraFiles := int64(cfg.TargetFiles) % int64(len(allDirs))
+	for i, dir := range allDirs {
+		categories[i] = getCategoryForPath(dir)
+		want := filesPerDir
+		if int64(i) < extraFiles {
+			want++
+		}
+		if resume {
+			if d := want - existingCounts[i]; d > 0 {
+				remaining[i] = d
+				plannedTotal += d
+			}
+		} else {
+			// Add some randomness
+			want += int64(rand.IntN(5) - 2)
+			if want < 1 {
+				want = 1
+			}
+			remaining[i] = want
+			plannedTotal += want
+		}
+	}
+	if resume {
+		over := totalExisting + plannedTotal - int64(cfg.TargetFiles)
+		for i := 0; i < len(remaining) && over > 0; i++ {
+			cut := remaining[i]
+			if cut > over {
+				cut = over
+			}
+			remaining[i] -= cut
+			over -= cut
+			plannedTotal -= cut
+		}
+		if plannedTotal <= 0 {
+			fmt.Printf("Nothing to do: tree already holds %d files (target %d)\n", totalExisting, cfg.TargetFiles)
+			return nil
+		}
+		fmt.Printf("Resume plan: creating %d files to reach %d total\n", plannedTotal, cfg.TargetFiles)
 	}
 
 	// Phase 2: Create files in parallel
@@ -536,6 +694,13 @@ func populateFilesystem() error {
 		close(done)
 	}()
 
+	// Resumed runs use the fr_ name series so they can never collide with
+	// files from the interrupted run (or from a previously crashed resume).
+	namePrefix := "f_%06d"
+	if resume {
+		namePrefix = "fr_%06d"
+	}
+
 	// Start worker goroutines
 	const logBatchSize = 256
 	for w := 0; w < cfg.Workers; w++ {
@@ -550,7 +715,7 @@ func populateFilesystem() error {
 
 			for job := range jobs {
 				ext := getExtensionForCategory(job.Category)
-				fileName := fmt.Sprintf("f_%06d%s", job.FileNum, ext)
+				fileName := fmt.Sprintf(namePrefix, job.FileNum) + ext
 				filePath := filepath.Join(job.Path, fileName)
 
 				// Determine file size
@@ -597,48 +762,35 @@ func populateFilesystem() error {
 	// serialized on the parent dir's inode lock, so concurrent workers only
 	// scale when their in-flight creates target different directories.
 	go func() {
-		filesPerDir := cfg.TargetFiles / len(allDirs)
-		if filesPerDir < 1 {
-			filesPerDir = 1
+		limit := int64(cfg.TargetFiles)
+		if resume {
+			limit = plannedTotal
 		}
-		extraFiles := cfg.TargetFiles % len(allDirs)
-
-		remaining := make([]int32, len(allDirs))
-		categories := make([]string, len(allDirs))
-		for i, dir := range allDirs {
-			numFiles := filesPerDir
-			if i < extraFiles {
-				numFiles++
-			}
-			// Add some randomness
-			numFiles = numFiles + rand.IntN(5) - 2
-			if numFiles < 1 {
-				numFiles = 1
-			}
-			remaining[i] = int32(numFiles)
-			categories[i] = getCategoryForPath(dir)
-		}
-
-		fileNum := 0
-		for fileNum < cfg.TargetFiles {
-			emitted := false
+		var emitted int64
+		for emitted < limit {
+			progressed := false
 			for i, dir := range allDirs {
 				if remaining[i] <= 0 {
 					continue
 				}
 				remaining[i]--
+				num := emitted
+				if resume {
+					num = resumeNextIdx[i]
+					resumeNextIdx[i]++
+				}
 				jobs <- FileJob{
 					Path:     dir,
 					Category: categories[i],
-					FileNum:  fileNum,
+					FileNum:  int(num),
 				}
-				fileNum++
-				emitted = true
-				if fileNum >= cfg.TargetFiles {
+				emitted++
+				progressed = true
+				if emitted >= limit {
 					break
 				}
 			}
-			if !emitted {
+			if !progressed {
 				break
 			}
 		}
@@ -654,17 +806,27 @@ func populateFilesystem() error {
 	finalElapsed := time.Since(startTime)
 	rate := float64(finalCount) / finalElapsed.Seconds()
 
+	requested := int64(cfg.TargetFiles)
+	if resume {
+		requested = plannedTotal
+	}
 	if failed := errCount.Load(); failed > 0 {
 		fmt.Printf("\n--- Population INCOMPLETE ---\n")
-		fmt.Printf("Total Files: %d (of %d requested)\n", finalCount, cfg.TargetFiles)
+		fmt.Printf("Total Files: %d (of %d requested)\n", finalCount, requested)
 		fmt.Printf("FAILED file creations: %d (first error: %v)\n", failed, firstErr.Load())
 		fmt.Printf("Total Directories: %d\n", currentDirs)
 		fmt.Printf("Time Taken: %s\n", finalElapsed.Round(time.Second))
-		return fmt.Errorf("%d of %d file creations failed", failed, int64(cfg.TargetFiles))
+		fmt.Println("Rerun with --resume to finish the remaining files.")
+		return fmt.Errorf("%d of %d file creations failed", failed, requested)
 	}
 
 	fmt.Printf("\n--- Population Complete ---\n")
-	fmt.Printf("Total Files: %d\n", finalCount)
+	if resume {
+		fmt.Printf("Files created this run: %d\n", finalCount)
+		fmt.Printf("Total Files in tree: %d\n", totalExisting+finalCount)
+	} else {
+		fmt.Printf("Total Files: %d\n", finalCount)
+	}
 	fmt.Printf("Total Directories: %d\n", currentDirs)
 	fmt.Printf("Time Taken: %s\n", finalElapsed.Round(time.Second))
 	fmt.Printf("Average Rate: %.0f files/sec\n", rate)
@@ -1197,10 +1359,12 @@ func main() {
 	var configPath string
 	var mode string
 	var shard string
+	var resume bool
 
 	flag.StringVar(&configPath, "config", "config.yaml", "Path to configuration file")
 	flag.StringVar(&mode, "mode", "", "Mode: populate or update")
 	flag.StringVar(&shard, "shard", "", "Subdirectory of base_dir to work in (for fanning out across nodes)")
+	flag.BoolVar(&resume, "resume", false, "Continue an interrupted populate run (rescans the tree, creates only missing files)")
 	flag.Parse()
 
 	if mode == "" && flag.NArg() > 0 {
@@ -1233,6 +1397,12 @@ func main() {
 		fmt.Println("Options:")
 		fmt.Println("  --config  Path to YAML configuration file (default: config.yaml)")
 		fmt.Println("  --shard   Work in <base_dir>/<shard> — run one shard per node to parallelize")
+		fmt.Println("  --resume  Continue an interrupted populate run (rescan tree, create only missing files)")
+		os.Exit(1)
+	}
+
+	if resume && mode != "populate" {
+		fmt.Println("FATAL: --resume is only valid with populate mode")
 		os.Exit(1)
 	}
 
@@ -1260,7 +1430,7 @@ func main() {
 
 	switch mode {
 	case "populate":
-		if err := populateFilesystem(); err != nil {
+		if err := populateFilesystem(resume); err != nil {
 			fmt.Printf("FATAL POPULATE ERROR: %v\n", err)
 			os.Exit(1)
 		}
