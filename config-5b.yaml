@@ -1,0 +1,59 @@
+# Benchmark: 5 billion tiny files
+#
+# SINGLE-NODE totals. At the measured ~16k creates/sec per node this is a
+# ~3.6 day run. To fan out across N nodes instead: divide target_files and
+# target_dirs by N, give each node its own VIP mount (see below), and run
+# a distinct shard per node:
+#   sudo ./fs-sim populate --config=./config-5b.yaml --shard=node01
+#
+# Each node should mount its OWN VAST VIP (172.200.204.1-8) at /mnt/source-nc
+# with nconnect=16, e.g.:
+#   sudo mount -t nfs -o vers=3,nconnect=16,rsize=1048576,wsize=1048576,hard,proto=tcp \
+#     172.200.204.2:/jpalumbo/source /mnt/source-nc
+# nconnect is ignored if the node already holds a connection to that server
+# IP, so each node must use a VIP it isn't already mounting.
+
+base_dir: "/mnt/source-nc/5b"
+
+# Path logging disabled: at 5B files the log alone would be ~400GB and
+# update mode isn't needed for this dataset.
+log_file: ""
+
+# 5B files / 5M dirs -> ~1000 files per directory
+target_dirs: 5000000
+target_files: 5000000000
+
+# Avg fanout is max_subdirs_per_dir/2 = 10; with 1 top-level dir, depth 8
+# reaches ~11M dirs, so the 5M target is achievable.
+max_depth: 8
+max_subdirs_per_dir: 20
+
+# Skip per-file chown/chmod/chtimes: each is an extra NFS round-trip.
+skip_metadata: true
+
+# Tiny files: 10-100 bytes, no large files (~275GB total data)
+file_size:
+  min_normal: 10
+  max_normal: 100
+  large_file_chance: 0
+  min_large: 100
+  max_large: 100
+
+# Create rate is NFS-latency-bound, not CPU-bound; 512 was the measured
+# sweet spot on an 8-core node (1024 was slightly slower).
+workers: 512
+
+file_extensions:
+  projects:
+    - ".dat"
+
+min_file_age: 1640995200
+max_file_age: 0
+uids: [1000]
+gids: [1000]
+action_weights:
+  create_file: 0
+  delete_file: 0
+  append_file: 0
+  change_metadata: 0
+  touch_file: 0
