@@ -1,0 +1,60 @@
+# Benchmark: 20 billion tiny files, sharded across nodes
+#
+# PER-SHARD config: targets below are for ONE shard. Run one shard per
+# client node with distinct names, e.g.:
+#   node01$ sudo ./fs-sim populate --config=./config-20b.yaml --shard=node01
+#   node02$ sudo ./fs-sim populate --config=./config-20b.yaml --shard=node02
+# 10 shards x 2B files = 20B total. Adjust target_files/target_dirs if you
+# run a different shard count. A failed shard can be deleted and rerun
+# alone without touching the others.
+
+# Each node should mount its OWN VAST VIP (172.200.204.1-8) at /mnt/source-nc
+# with nconnect=16, e.g. on node 2:
+#   sudo mount -t nfs -o vers=3,nconnect=16,rsize=1048576,wsize=1048576,hard,proto=tcp \
+#     172.200.204.2:/jpalumbo/source /mnt/source-nc
+# nconnect is ignored if the node already holds a connection to that server IP,
+# so each node must use a VIP it isn't already mounting.
+base_dir: "/mnt/source-nc/20b"
+
+# Path logging disabled: at 2B files/shard the log alone would be ~150GB+
+# per shard, and update mode isn't needed for this dataset.
+log_file: ""
+
+# 2B files / 2M dirs per shard -> ~1000 files per directory
+target_dirs: 2000000
+target_files: 2000000000
+
+# Avg fanout is max_subdirs_per_dir/2 = 10; with 1 top-level dir, depth 8
+# reaches ~11M dirs, so the 2M target is comfortably achievable.
+max_depth: 8
+max_subdirs_per_dir: 20
+
+# Skip per-file chown/chmod/chtimes: each is an extra NFS round-trip,
+# so this roughly halves the per-file cost.
+skip_metadata: true
+
+# Tiny files: 10-100 bytes, no large files
+file_size:
+  min_normal: 10
+  max_normal: 100
+  large_file_chance: 0
+  min_large: 100
+  max_large: 100
+
+# Create rate is NFS-latency-bound, not CPU-bound: go well past core count.
+workers: 512
+
+file_extensions:
+  projects:
+    - ".dat"
+
+min_file_age: 1640995200
+max_file_age: 0
+uids: [1000]
+gids: [1000]
+action_weights:
+  create_file: 0
+  delete_file: 0
+  append_file: 0
+  change_metadata: 0
+  touch_file: 0

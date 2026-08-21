@@ -47,6 +47,10 @@ type Config struct {
 	MaxDepth         int                 `yaml:"max_depth"`
 	MaxSubdirsPerDir int                 `yaml:"max_subdirs_per_dir"`
 	FileExtensions   map[string][]string `yaml:"file_extensions"`
+	// SkipMetadata disables per-file chown/chmod/chtimes in populate mode.
+	// Each of those is an extra NFS round-trip per file, so skipping them
+	// roughly halves the syscall cost of a create.
+	SkipMetadata bool `yaml:"skip_metadata"`
 
 	// Torture mode config - for creating flat directories with massive file counts
 	Torture struct {
@@ -116,9 +120,9 @@ func loadConfig(path string) error {
 	if cfg.BaseDir == "" {
 		return fmt.Errorf("base_dir is required in config")
 	}
-	if cfg.LogFile == "" {
-		return fmt.Errorf("log_file is required in config")
-	}
+	// LogFile is optional for populate/torture/deep: an empty value disables
+	// path logging (at billions of files the log itself is terabytes).
+	// Update mode requires it and checks separately.
 	if len(cfg.UIDs) == 0 {
 		return fmt.Errorf("at least one UID is required in config")
 	}
@@ -358,6 +362,12 @@ func populateFilesystem() error {
 	fmt.Printf("Targets: %d files, up to %d directories\n", cfg.TargetFiles, cfg.TargetDirs)
 	fmt.Printf("Base directory: %s\n", cfg.BaseDir)
 	fmt.Printf("Workers: %d\n", cfg.Workers)
+	fmt.Printf("Skip metadata: %v\n", cfg.SkipMetadata)
+	if cfg.LogFile == "" {
+		fmt.Println("Path logging: disabled (update mode will not work on this dataset)")
+	} else {
+		fmt.Printf("Path log: %s\n", cfg.LogFile)
+	}
 	startTime := time.Now()
 
 	// Ensure base directory exists
@@ -385,7 +395,9 @@ func populateFilesystem() error {
 		if err := os.MkdirAll(path, 0755); err != nil {
 			fmt.Printf("Warning: Could not create %s: %v\n", path, err)
 		}
-		setMetadata(path, true)
+		if !cfg.SkipMetadata {
+			setMetadata(path, true)
+		}
 	}
 
 	// Phase 1: Create all directories in parallel, level-by-level (BFS).
@@ -415,6 +427,12 @@ func populateFilesystem() error {
 		var nextMu sync.Mutex
 		var dirWg sync.WaitGroup
 
+		// With few parents at this level, a run of zero-child rolls can stall
+		// the whole tree (worst case: a single top-level dir rolls 0 and the
+		// entire population lands flat in one directory). Guarantee at least
+		// one child per parent while the level is still narrow.
+		ensureChild := len(currentLevel) <= 2
+
 		for w := 0; w < cfg.Workers; w++ {
 			dirWg.Add(1)
 			go func() {
@@ -425,6 +443,9 @@ func populateFilesystem() error {
 						continue
 					}
 					numSubDirs := rand.IntN(cfg.MaxSubdirsPerDir + 1)
+					if numSubDirs == 0 && ensureChild {
+						numSubDirs = 1
+					}
 					for i := 0; i < numSubDirs; i++ {
 						counter := totalDirs.Add(1)
 						if counter > target {
@@ -435,7 +456,9 @@ func populateFilesystem() error {
 						if err := os.Mkdir(newDirPath, 0755); err != nil {
 							continue
 						}
-						setMetadata(newDirPath, true)
+						if !cfg.SkipMetadata {
+							setMetadata(newDirPath, true)
+						}
 						local = append(local, newDirPath)
 					}
 				}
@@ -477,16 +500,27 @@ func populateFilesystem() error {
 	done := make(chan struct{})
 
 	var fileCount atomic.Int64
+	var errCount atomic.Int64
+	var firstErr atomic.Value // holds the first error, for the final report
 	var wg sync.WaitGroup
+
+	logEnabled := cfg.LogFile != ""
 
 	// Start log writer goroutine
 	go func() {
+		if !logEnabled {
+			for range results {
+			}
+			close(done)
+			return
+		}
 		logFile, err := os.OpenFile(cfg.LogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 		if err != nil {
 			fmt.Printf("Warning: Could not open log file: %v\n", err)
 			// Drain results channel
 			for range results {
 			}
+			close(done)
 			return
 		}
 		defer logFile.Close()
@@ -526,14 +560,21 @@ func populateFilesystem() error {
 				}
 
 				if err := writeRandomDataFast(filePath, fileSize, fr, chunk); err != nil {
+					if errCount.Add(1) == 1 {
+						firstErr.Store(err)
+					}
 					continue
 				}
-				setMetadata(filePath, false)
+				if !cfg.SkipMetadata {
+					setMetadata(filePath, false)
+				}
 
-				batch = append(batch, filePath)
-				if len(batch) >= logBatchSize {
-					results <- batch
-					batch = make([]string, 0, logBatchSize)
+				if logEnabled {
+					batch = append(batch, filePath)
+					if len(batch) >= logBatchSize {
+						results <- batch
+						batch = make([]string, 0, logBatchSize)
+					}
 				}
 
 				count := fileCount.Add(1)
@@ -550,21 +591,21 @@ func populateFilesystem() error {
 		}()
 	}
 
-	// Generate file jobs - distribute files across directories
+	// Generate file jobs - distribute files across directories.
+	// Jobs are emitted round-robin (one file per directory per round) rather
+	// than filling each directory in turn: creates within one directory are
+	// serialized on the parent dir's inode lock, so concurrent workers only
+	// scale when their in-flight creates target different directories.
 	go func() {
-		fileNum := 0
 		filesPerDir := cfg.TargetFiles / len(allDirs)
 		if filesPerDir < 1 {
 			filesPerDir = 1
 		}
 		extraFiles := cfg.TargetFiles % len(allDirs)
 
+		remaining := make([]int32, len(allDirs))
+		categories := make([]string, len(allDirs))
 		for i, dir := range allDirs {
-			if fileNum >= cfg.TargetFiles {
-				break
-			}
-
-			category := getCategoryForPath(dir)
 			numFiles := filesPerDir
 			if i < extraFiles {
 				numFiles++
@@ -574,14 +615,31 @@ func populateFilesystem() error {
 			if numFiles < 1 {
 				numFiles = 1
 			}
+			remaining[i] = int32(numFiles)
+			categories[i] = getCategoryForPath(dir)
+		}
 
-			for j := 0; j < numFiles && fileNum < cfg.TargetFiles; j++ {
+		fileNum := 0
+		for fileNum < cfg.TargetFiles {
+			emitted := false
+			for i, dir := range allDirs {
+				if remaining[i] <= 0 {
+					continue
+				}
+				remaining[i]--
 				jobs <- FileJob{
 					Path:     dir,
-					Category: category,
+					Category: categories[i],
 					FileNum:  fileNum,
 				}
 				fileNum++
+				emitted = true
+				if fileNum >= cfg.TargetFiles {
+					break
+				}
+			}
+			if !emitted {
+				break
 			}
 		}
 		close(jobs)
@@ -595,6 +653,15 @@ func populateFilesystem() error {
 	finalCount := fileCount.Load()
 	finalElapsed := time.Since(startTime)
 	rate := float64(finalCount) / finalElapsed.Seconds()
+
+	if failed := errCount.Load(); failed > 0 {
+		fmt.Printf("\n--- Population INCOMPLETE ---\n")
+		fmt.Printf("Total Files: %d (of %d requested)\n", finalCount, cfg.TargetFiles)
+		fmt.Printf("FAILED file creations: %d (first error: %v)\n", failed, firstErr.Load())
+		fmt.Printf("Total Directories: %d\n", currentDirs)
+		fmt.Printf("Time Taken: %s\n", finalElapsed.Round(time.Second))
+		return fmt.Errorf("%d of %d file creations failed", failed, int64(cfg.TargetFiles))
+	}
 
 	fmt.Printf("\n--- Population Complete ---\n")
 	fmt.Printf("Total Files: %d\n", finalCount)
@@ -1129,9 +1196,11 @@ func runDynamicUpdate() error {
 func main() {
 	var configPath string
 	var mode string
+	var shard string
 
 	flag.StringVar(&configPath, "config", "config.yaml", "Path to configuration file")
 	flag.StringVar(&mode, "mode", "", "Mode: populate or update")
+	flag.StringVar(&shard, "shard", "", "Subdirectory of base_dir to work in (for fanning out across nodes)")
 	flag.Parse()
 
 	if mode == "" && flag.NArg() > 0 {
@@ -1142,8 +1211,17 @@ func main() {
 		flag.CommandLine.Parse(flag.Args()[1:])
 	}
 
+	// A leftover positional argument is almost always a config path missing
+	// its --config flag. Silently ignoring it means running with the wrong
+	// config, so refuse to proceed.
+	if flag.CommandLine.NArg() > 0 {
+		fmt.Printf("FATAL: unexpected argument %q — did you mean --config=%s?\n",
+			flag.CommandLine.Arg(0), flag.CommandLine.Arg(0))
+		os.Exit(1)
+	}
+
 	if mode == "" {
-		fmt.Println("Usage: fs-sim [--config config.yaml] <mode>")
+		fmt.Println("Usage: fs-sim <mode> [--config config.yaml] [--shard name]")
 		fmt.Println("       fs-sim --mode=<mode> [--config=config.yaml]")
 		fmt.Println("")
 		fmt.Println("Modes:")
@@ -1154,12 +1232,28 @@ func main() {
 		fmt.Println("")
 		fmt.Println("Options:")
 		fmt.Println("  --config  Path to YAML configuration file (default: config.yaml)")
+		fmt.Println("  --shard   Work in <base_dir>/<shard> — run one shard per node to parallelize")
 		os.Exit(1)
 	}
 
 	fmt.Printf("Loading configuration from: %s\n", configPath)
 	if err := loadConfig(configPath); err != nil {
 		fmt.Printf("FATAL: Failed to load config: %v\n", err)
+		os.Exit(1)
+	}
+
+	if shard != "" {
+		cfg.BaseDir = filepath.Join(cfg.BaseDir, shard)
+		if cfg.LogFile != "" {
+			// Give each shard its own log so concurrent nodes don't clobber
+			// one shared file.
+			cfg.LogFile = cfg.LogFile + "." + shard
+		}
+		fmt.Printf("Shard: %s (base_dir=%s)\n", shard, cfg.BaseDir)
+	}
+
+	if mode == "update" && cfg.LogFile == "" {
+		fmt.Println("FATAL: update mode requires log_file in config (populate ran with logging disabled?)")
 		os.Exit(1)
 	}
 	fmt.Printf("Configuration loaded successfully\n\n")
