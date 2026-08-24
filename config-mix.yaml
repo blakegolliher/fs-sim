@@ -2,7 +2,8 @@
 # 500K files across 10K directories
 # Tests: Production-like traversal patterns
 
-base_dir: "/mnt/syncengine-demo/bench/mix"
+# base_dir: "/mnt/syncengine-demo/bench/mix"
+base_dir: "/mnt/source"
 log_file: "/tmp/fs_sim_mix.log"
 
 target_dirs: 10000

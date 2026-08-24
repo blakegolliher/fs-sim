@@ -23,8 +23,8 @@ log_file: "/tmp/fs_sim_200m_mix.log"
 target_dirs: 150000
 target_files: 200000000
 
-max_depth: 6
-max_subdirs_per_dir: 10
+max_depth: 8 
+max_subdirs_per_dir: 20
 
 # Small files (4KB avg) with 1% large files
 file_size:
@@ -34,7 +34,7 @@ file_size:
   min_large: 1048576       # 1MB
   max_large: 10485760      # 10MB
 
-workers: 64
+workers: 256
 
 # Timestamp range: Jan 1 2024 - now (~Feb 2026) = 2+ years
 min_file_age: 1704067200   # January 1, 2024 00:00:00 UTC
