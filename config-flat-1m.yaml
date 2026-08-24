@@ -1,0 +1,41 @@
+# FS-Simulator - 1M Flat Directory Config
+# Creates a single flat directory with 1 million files
+
+# Base directory
+base_dir: "/mnt/fs-tourture"
+
+# Log file (required by config parser)
+log_file: "/tmp/fs_flat_1m.log"
+
+# Parallel workers - 64 workers for 8 cores (I/O bound)
+workers: 64
+
+# User/Group IDs (only used if skip_metadata is false)
+uids: [1000]
+gids: [1000]
+
+# Dummy file_extensions (required by config parser)
+file_extensions:
+  data:
+    - ".dat"
+
+# TORTURE MODE CONFIGURATION
+torture:
+  # Single flat directory
+  flat_dirs:
+    - "flat_1m"
+
+  # 1 million files
+  files_per_dir: 1000000
+
+  # Fixed file size in bytes
+  file_size_bytes: 128
+
+  # Skip metadata for speed
+  skip_metadata: true
+
+  # Skip existing files (useful for resuming)
+  skip_existing: false
+
+  # Progress report interval
+  report_interval: 100000

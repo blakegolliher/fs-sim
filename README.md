@@ -10,6 +10,19 @@ A high-performance tool for generating and dynamically updating a simulated file
 - Assigns random UIDs/GIDs and historical timestamps
 - Dynamic update mode for ongoing filesystem changes
 
+## Download
+
+Prebuilt static binaries are on the [releases page](https://github.com/blakegolliher/fs-sim/releases) (Linux x86_64/arm64, macOS Intel/Apple Silicon):
+
+```bash
+curl -LO https://github.com/blakegolliher/fs-sim/releases/latest/download/fs-sim-linux-amd64
+curl -LO https://github.com/blakegolliher/fs-sim/releases/latest/download/config-quickstart.yaml
+chmod +x fs-sim-linux-amd64
+
+# edit base_dir in config-quickstart.yaml to point at your mount, then:
+./fs-sim-linux-amd64 --config=config-quickstart.yaml populate
+```
+
 ## Usage
 
 ### Build
@@ -25,6 +38,27 @@ Creates the initial filesystem structure:
 ```bash
 ./fs-sim --config=config.yaml populate
 ```
+
+Populate refuses to run on top of an existing tree. If a run was interrupted,
+continue it with `--resume` — the tree is rescanned and only the missing files
+are created (named `fr_<n>` so they can never collide with the original run):
+
+```bash
+./fs-sim populate --config=config.yaml --resume
+```
+
+To fan a huge populate out across multiple nodes, give each node its own
+shard — it works in `<base_dir>/<shard>` with its own log file:
+
+```bash
+./fs-sim populate --config=config.yaml --shard=node1   # on node 1
+./fs-sim populate --config=config.yaml --shard=node2   # on node 2
+```
+
+For maximum create throughput set `skip_metadata: true` in the config to skip
+per-file chown/chmod/chtimes, and set `log_file: ""` to disable path logging
+(at billions of files the log itself is terabytes; update mode needs the log,
+so leave it on for datasets you want to churn later).
 
 ### Update Mode
 
@@ -50,17 +84,40 @@ See `config.yaml` for all options. Key settings:
 
 ### Tuning Performance
 
-The `workers` setting controls parallelism. Set to `0` to auto-detect CPU count, or specify a value to match your storage system's capabilities:
+The `workers` setting controls parallelism. File creation against NFS is
+latency-bound, not CPU-bound: each create is a wire round-trip, so you want
+many more workers than cores. Set to `0` to auto-size (4x CPU count, capped
+at 256), or set it explicitly:
 
 ```yaml
-# Auto-detect (uses all CPUs)
+# Auto (4x CPU count — good NFS default)
 workers: 0
 
-# Fixed thread count
-workers: 64
+# Explicit — try 8-16x cores against a fast NFS array
+workers: 128
 ```
 
-Higher thread counts can improve throughput on fast storage (NVMe, parallel filesystems), while lower counts may be better for spinning disks.
+Higher counts help fast storage (NVMe, parallel filesystems, scale-out NAS);
+lower counts may be better for spinning disks.
+
+### Tuning for NFS targets
+
+- **Spread across directories.** Linux holds a per-directory kernel lock for
+  every create — across the whole NFS round-trip — so creates only run in
+  parallel when they target *different* directories. Populate mode schedules
+  work directory-per-worker automatically. In torture mode, list several
+  `flat_dirs`: they are all filled concurrently, and one flat dir caps
+  create throughput at roughly 1/latency regardless of worker count.
+- **Mount options.** `nconnect=16` multiplies TCP connections per mount.
+  Two instances against two mounts of the same export (with `nosharecache`)
+  sidestep the single-client directory lock for flat-dir tests.
+- **Syscall budget.** Files and dirs are created with their final mode baked
+  into `open`/`mkdir` (umask is cleared at startup), so most objects cost no
+  chmod SETATTR. Timestamps are one SETATTR per file, applied after close;
+  directory timestamps are restamped once at the end (phase 3), after the
+  children that would have clobbered them.
+- **Root is optional.** Only random uid/gid assignment needs root (chown is
+  skipped otherwise); permissions and timestamps work as any user.
 
 ## Running Update Mode via Cron
 
@@ -81,6 +138,15 @@ Adjust `update_duration_seconds` in your config to control how long each run las
 
 ## Prerequisites
 
-- Go 1.21+ (for building)
+- Go 1.22+ (for building)
 - UIDs/GIDs in config must exist on the system (see `create_users.sh`)
-- Run as root for full ownership/permission functionality
+- Run as root for random ownership assignment (everything else works unprivileged)
+
+## Tests
+
+```bash
+go test ./...
+```
+
+Covers exact file-count accounting, permission/timestamp application,
+flat-dir parallel fills, and the log-writer failure path.
